@@ -1,7 +1,7 @@
 # ScaffoldTuner
 
 A Python toolkit for proposing structurally modified drug-like molecules based on Murcko scaffolds.  
-Given a parent molecule (SMILES), ScaffoldTuner systematically replaces side chains to increase or decrease specific molecular features such as hydrogen bond donors/acceptors, aromatic rings, rotatable bonds, and heteroatom counts.
+Given a parent molecule (SMILES), ScaffoldTuner modifies substituents around the Murcko scaffold to increase or decrease specific molecular features such as hydrogen bond donors/acceptors, aromatic rings, rotatable bonds, and heteroatom counts.
 
 ---
 
@@ -9,7 +9,7 @@ Given a parent molecule (SMILES), ScaffoldTuner systematically replaces side cha
 
 - Extracts Murcko scaffold from a parent molecule
 - Decomposes R-groups using RDKit's R-group decomposition
-- Proposes candidate molecules by replacing one substituent at a time
+- Proposes candidate molecules by modifying one substituent site at a time
 - Supports 10 modification modes (see below)
 - Filters candidates by whether the target feature changes in the intended direction
 - Optional `strict` mode: ensures only the target feature changes
@@ -32,13 +32,13 @@ conda install -c conda-forge rdkit
 ### Option 1: Install directly from GitHub (recommended)
 
 ```bash
-pip install git+https://github.com/tesaki1101/scaffold-tuner.git
+pip install git+https://github.com/tesaki2019/scaffold-tuner.git
 ```
 
 ### Option 2: Clone and install locally
 
 ```bash
-git clone https://github.com/tesaki1101/scaffold-tuner.git
+git clone https://github.com/tesaki2019/scaffold-tuner.git
 cd scaffold-tuner
 pip install -e .
 ```
@@ -52,7 +52,7 @@ Paste the following into the first cell of your Google Colab notebook and run it
 !pip install rdkit
 
 # Install ScaffoldTuner
-!pip install git+https://github.com/tesaki1101/scaffold-tuner.git
+!pip install git+https://github.com/tesaki2019/scaffold-tuner.git
 ```
 
 After installation, you can use the package in the same session:
