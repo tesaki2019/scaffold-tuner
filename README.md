@@ -1,146 +1,40 @@
 # ScaffoldTuner
 
-A Python library for proposing structurally modified drug-like molecules
-using a **descriptor-indexed R-group transformation library**.
-
-Given a parent molecule and a desired descriptor change (e.g. `HBA +1`),
-ScaffoldTuner retrieves observed R-group transformations from a pre-built
-library, applies only those whose `from_fragment` exactly matches a parent
-R-group, and validates the exact descriptor change on the full generated
-molecule with RDKit.
+A lightweight Python tool for proposing R-group modifications to drug-like
+molecules.  Given a parent molecule and a desired descriptor change,
+ScaffoldTuner generates candidate structures by substituting R-groups at
+scaffold attachment points and retaining only those where the requested
+descriptor change is confirmed by RDKit on the full molecule.
 
 ---
 
-## Core concept
+## Features
 
-ScaffoldTuner v2 is built around one idea:
-
-> **desired descriptor change → transformation retrieval → generation → exact validation**
-
-This differs from CReM, which starts from chemical context:
-
-| | CReM | ScaffoldTuner v2 |
-|---|---|---|
-| **Retrieval key** | Local chemical context (ECFP-like radius) | Desired descriptor delta |
-| **Starting point** | Structure → find compatible replacements | Descriptor goal → find matching transformations |
-| **R-group match** | Context radius match | Exact canonical SMILES (default) |
-| **Scaffold** | Not constrained | Parent scaffold retained as substructure |
-| **Validation** | Context match | Whole-molecule RDKit recomputation |
-
-### Pipeline
-
-```
-desired descriptor change  (e.g. HBA +1)
-        ↓
-Step 1: descriptor-indexed retrieval
-        library[delta_HBA == +1]   ← fragment-level pre-filter
-        ↓
-Step 2: exact R-group match  (match_mode="exact", default)
-        parent R-group == from_fragment  (canonical SMILES)
-        ↓
-Step 3: candidate generation
-        ↓
-Step 4: RDKit sanitization
-        ↓
-Step 5: parent scaffold retained as substructure
-        generated_mol.HasSubstructMatch(parent_scaffold_mol)
-        ↓
-Step 6: whole-molecule descriptor recomputation
-        actual_delta = generated_HBA - parent_HBA
-        ↓
-Step 7: exact requested delta validation
-        actual_delta == requested_delta
-        ↓
-Step 8: optional strict filtering
-        ↓
-Step 9: ranking
-        ↓
-Step 10: optional MaxMin diversity selection
-        ↓
-Top-N candidates + full provenance
-```
+- Preserves the parent Murcko scaffold in every returned candidate
+- Evaluates 25 literature-informed R-groups (unified pool) at each
+  attachment site — no descriptor-specific sub-pool
+- Validates descriptor changes on the **whole molecule** with RDKit
+- `strict=True` mode: ensures only the target descriptor changes
+- Removes duplicate candidates automatically
+- Optional MaxMin diversity selection
 
 ---
 
-## Scaffold preservation
+## Supported descriptor modifications
 
-"Scaffold preserved" means:
+| target | delta | Legacy mode string |
+|--------|-------|--------------------|
+| `HBD`  | +1    | `add_hbd`          |
+| `HBD`  | -1    | `remove_hbd`       |
+| `HBA`  | +1    | `add_hba`          |
+| `HBA`  | -1    | `remove_hba`       |
+| `AR`   | +1    | `add_ar`           |
+| `RotB` | +1    | `add_rb`           |
+| `RotB` | -1    | `remove_rb`        |
+| `HA`   | +1    | `add_ha`           |
+| `HA`   | -1    | `remove_ha`        |
 
-```python
-generated_mol.HasSubstructMatch(parent_scaffold_mol)  # True
-```
-
-The parent Murcko scaffold is **retained as a substructure** in the
-generated molecule.  This does NOT mean the generated molecule's own
-Murcko scaffold is identical to the parent's.  For example, adding an
-aromatic ring to a side-chain (AR +1) may extend the generated molecule's
-Murcko scaffold while still containing the parent scaffold as a substructure.
-
----
-
-## Note on delta values
-
-The library stores **fragment-level** delta values (`delta_HBA`, etc.).
-These are used as a retrieval pre-filter (Step 1) only.
-
-The final acceptance criterion is always the **whole-molecule actual_delta**
-computed by RDKit after generation (Step 7).  Fragment-level and
-whole-molecule deltas can differ, particularly for `RotB`, because rotatable
-bond count depends on the attachment bond and ring context of the full molecule.
-
-Each result record clearly distinguishes:
-
-- `library_delta`  — fragment-level delta from the library (retrieval only)
-- `actual_delta`   — whole-molecule delta confirmed by RDKit (final criterion)
-
----
-
-## Exact matching and similarity fallback
-
-**Exact R-group matching is used by default (`match_mode="exact"`).**
-Only transformations whose `from_fragment` is canonically identical to the
-parent R-group are applied.  If no exact match exists for a given site,
-zero candidates are returned for that site — no silent fallback.
-
-Similarity-based fallback (`match_mode="similarity"`) is available as an
-**optional exploratory mode only**.  It must NOT be used in benchmark
-comparisons, because it weakens the traceability to observed transformations.
-
----
-
-## Supported modifications
-
-### Supported
-
-| target | delta | Legacy mode | Description |
-|---|---|---|---|
-| `HBD` | +1 | `add_hbd` | Increase hydrogen bond donors |
-| `HBD` | -1 | `remove_hbd` | Decrease hydrogen bond donors |
-| `HBA` | +1 | `add_hba` | Increase hydrogen bond acceptors |
-| `HBA` | -1 | `remove_hba` | Decrease hydrogen bond acceptors |
-| `AR`  | +1 | `add_ar` | Increase number of aromatic rings |
-| `RotB`| +1 | `add_rb` | Increase number of rotatable bonds |
-| `RotB`| -1 | `remove_rb` | Decrease number of rotatable bonds |
-| `HA`  | +1 | `add_ha` | Increase number of heteroatoms |
-| `HA`  | -1 | `remove_ha` | Decrease number of heteroatoms |
-
-### Not supported
-
-| target | delta | Reason |
-|---|---|---|
-| `AR` | -1 | Removing an aromatic ring from an R-group requires modifying the scaffold. Raises `ValueError`. |
-
----
-
-## Requirements
-
-- Python 3.8+
-- [RDKit](https://www.rdkit.org/)
-- pandas
-
-```bash
-conda install -c conda-forge rdkit pandas
-```
+`AR -1` (`remove_ar`) is not supported in the current implementation.
 
 ---
 
@@ -148,274 +42,185 @@ conda install -c conda-forge rdkit pandas
 
 ```bash
 # From GitHub
-pip install git+https://github.com/tesaki2019/scaffold-tuner.git
+pip install git+https://github.com/tesak1101/scaffold-tuner.git
 
 # Local development
-git clone https://github.com/tesaki2019/scaffold-tuner.git
+git clone https://github.com/tesak1101/scaffold-tuner.git
 cd scaffold-tuner
 pip install -e .
+```
+
+**Requirements:** Python 3.8+, RDKit, pandas
+
+```bash
+conda install -c conda-forge rdkit
 ```
 
 ### Google Colab
 
 ```python
-!pip install rdkit pandas
-!pip install git+https://github.com/tesaki2019/scaffold-tuner.git
+!pip install rdkit
+!pip install git+https://github.com/tesak1101/scaffold-tuner.git
 ```
 
-> **Note:** In Google Colab, packages reset when the session ends.
-> Run the installation cell at the beginning of each new session.
+> In Google Colab, packages reset when the session ends.
+> Run the installation cell at the start of each new session.
 
 ---
 
-## Building the transformation library
-
-The transformation library is a CSV file of observed R-group transformations
-with pre-computed fragment-level descriptor deltas, derived from ChEMBL or
-any other compound dataset.
-
-```bash
-python scripts/build_transformation_library.py \
-    --input chembl_compounds.csv \
-    --output transformation_library.csv \
-    --smiles-col smiles \
-    --id-col chembl_id \
-    --min-frequency 2 \
-    --max-heavy-atoms 10 \
-    --source ChEMBL
-```
-
-After building, the script prints the actual statistics for your library:
-
-```
-============================================================
-  Transformation Library Summary
-============================================================
-  Source compounds         :  (actual value)
-  R-group extraction OK    :  (actual value)
-  R-group extraction failed:  (actual value)
-  Unique Murcko scaffolds  :  (actual value)   ← from source data
-  Unique R-groups          :  (actual value)
-  Unique transformations   :  (actual value)
-  Total observations       :  (actual value)
-
-  Descriptor-indexed transformations
-  ----------------------------------------
-  Task          Unique trans    Total obs
-  HBD +1             (actual)     (actual)
-  ...
-
-  Frequency distribution
-  ----------------------------------------
-  freq == 1   :     (actual)
-  freq >= 2   :     (actual)
-  ...
-============================================================
-```
-
-The "Unique Murcko scaffolds" count is computed from the source compounds
-directly (before transformation aggregation).
-
-### Library format
-
-| Column | Type | Description |
-|---|---|---|
-| `from_fragment` | str | Source R-group SMILES, attachment as `[*]` |
-| `to_fragment` | str | Target R-group SMILES, attachment as `[*]` |
-| `delta_HBD` | int | Fragment-level ΔNumHDonors |
-| `delta_HBA` | int | Fragment-level ΔNumHAcceptors |
-| `delta_AR` | int | Fragment-level ΔNumAromaticRings |
-| `delta_RotB` | int | Fragment-level ΔNumRotatableBonds |
-| `delta_HA` | int | Fragment-level ΔNumHeteroatoms (default 0) |
-| `frequency` | int | Observed count (default 1) |
-| `source` | str | Source label, e.g. `"ChEMBL"` (default `"unknown"`) |
-
----
-
-## Usage
-
-### New API (v2)
+## Quick start
 
 ```python
-from scaffold_tuner.scaffold_intervention import (
-    load_transformation_library,
-    propose_structures,
-    print_proposals,
-)
+from scaffold_tuner.scaffold_intervention import propose_structures, print_proposals
 
-# Load once; cached in memory
-lib = load_transformation_library("transformation_library.csv")
-
-parent_smiles = "c1ccc(NC(=O)c2ccccc2)cc1"
+parent_smiles = "c1ccc(NC(=O)c2ccccc2)cc1"  # benzanilide
 
 results = propose_structures(
-    parent_smiles=parent_smiles,
-    target="HBA",   # HBD | HBA | AR | RotB | HA
-    delta=1,        # +1 or -1  (AR: +1 only)
-    transformation_library=lib,
-    max_candidates=10,
-    match_mode="exact",   # always use "exact" for benchmarks
+    parent_smiles,
+    target="HBA",   # descriptor to change
+    delta=1,        # +1 or -1
+    max_candidates=5,
 )
 
 print_proposals(results)
 ```
 
-### Legacy API (backward-compatible)
-
-```python
-results = propose_structures(
-    parent_smiles=parent_smiles,
-    mode="add_hba",             # converted to target="HBA", delta=+1
-    transformation_library=lib,
-)
-```
-
-### With strict mode
-
-```python
-# strict=True: target descriptor changes by delta AND no other descriptor changes
-results = propose_structures(
-    parent_smiles=parent_smiles,
-    target="HBA", delta=1,
-    transformation_library=lib,
-    strict=True,
-)
-```
-
-### With diversity selection
-
-```python
-results = propose_structures(
-    parent_smiles=parent_smiles,
-    target="HBA", delta=1,
-    transformation_library=lib,
-    max_candidates=10,
-    diversity=True,    # MaxMin selection after ranking
-)
-```
-
-### Exploratory mode (NOT for benchmarks)
-
-```python
-# similarity fallback: only when match_mode="similarity" is explicit
-results = propose_structures(
-    parent_smiles=parent_smiles,
-    target="HBA", delta=1,
-    transformation_library=lib,
-    match_mode="similarity",
-    similarity_threshold=0.5,
-)
-```
-
-### Example output
+**Example output:**
 
 ```
 === Candidate 1 ===
-target: HBA  requested: +1  library: +1  actual: +1  site: R1  collateral: 1
-from → to : [*:1]C → [*:1]OC
-freq: 253  source: ChEMBL  match: exact (1.000)
-scaffold_preserved: True  parent scaffold: c1ccc(cc1)
-parent   : O=C(Nc1ccccc1)c1ccc(C)cc1
-generated: COc1ccc(C(=O)Nc2ccccc2)cc1
+target: HBA  requested: +1  actual: +1  site: R1  collateral: 1
+to_fragment      : [*:1]C#N
+scaffold_preserved: True
+parent   : O=C(Nc1ccccc1)c1ccccc1
+generated: N#Cc1ccc(NC(=O)c2ccccc2)cc1
 features ['NumHAcceptors', 'NumHDonors', 'NumAromaticRings', 'NumRotatableBonds', 'NumHeteroatoms']
-  parent   : (1, 1, 2, 2, 2)
-  generated: (2, 1, 2, 3, 3)
+  parent   : (1, 1, 2, 2, 1)
+  generated: (2, 1, 2, 2, 2)
 ```
+
+### Legacy mode strings
+
+```python
+# Equivalent to target="HBD", delta=1
+results = propose_structures(parent_smiles, mode="add_hbd", max_candidates=5)
+```
+
+---
+
+## How it works
+
+```
+Parent molecule
+      ↓
+Murcko scaffold extraction + R-group decomposition
+      ↓
+Substitute each of the 25 unified R-groups at every attachment site
+      ↓
+Recalculate whole-molecule descriptors with RDKit
+      ↓
+Retain candidates where actual_delta == requested_delta
+      ↓
+Scaffold retention check: HasSubstructMatch(parent_scaffold)
+      ↓
+Optional strict filtering (no other descriptor may change)
+      ↓
+Rank by collateral descriptor change, then pool order
+      ↓
+Return top-N candidates
+```
+
+Descriptor validation is always performed on the **complete generated
+molecule**.  No pre-filtering based on assumed R-group properties is used.
+
+---
+
+## Unified R-group pool
+
+All 25 candidate R-groups are stored in `scaffold_tuner/rgroup_pool.py`.
+
+| # | Name | SMILES |
+|---|------|--------|
+| 1  | amino          | `[*:1]N`           |
+| 2  | methylamino    | `[*:1]NC`          |
+| 3  | hydroxy        | `[*:1]O`           |
+| 4  | 3-pyrrolyl     | `[*:1]c1ccc[nH]1`  |
+| 5  | indolyl        | `[*:1]c1ccc2[nH]ccc2c1` |
+| 6  | methyl         | `[*:1]C`           |
+| 7  | ethyl          | `[*:1]CC`          |
+| 8  | fluoro         | `[*:1]F`           |
+| 9  | chloro         | `[*:1]Cl`          |
+| 10 | isopropyl      | `[*:1]C(C)C`       |
+| 11 | methoxy        | `[*:1]OC`          |
+| 12 | cyano          | `[*:1]C#N`         |
+| 13 | acetyl         | `[*:1]C(=O)C`      |
+| 14 | dimethylamino  | `[*:1]N(C)C`       |
+| 15 | methylsulfonyl | `[*:1]S(=O)(=O)C`  |
+| 16 | phenyl         | `[*:1]c1ccccc1`    |
+| 17 | pyridyl        | `[*:1]c1ccncc1`    |
+| 18 | 2-furyl        | `[*:1]c1ccco1`     |
+| 19 | 2-thienyl      | `[*:1]c1cccs1`     |
+| 20 | n-propyl       | `[*:1]CCC`         |
+| 21 | n-butyl        | `[*:1]CCCC`        |
+| 22 | methoxymethyl  | `[*:1]COC`         |
+| 23 | acetonyl       | `[*:1]CC(=O)C`     |
+| 24 | cyclopropyl    | `[*:1]C1CC1`       |
+| 25 | cyclohexyl     | `[*:1]C1CCCCC1`    |
+
+The pool is based on a manual curation of common medicinal chemistry
+R-groups.  Literature references are stored as metadata in `rgroup_pool.py`
+and are not used for candidate selection or ranking.
 
 ---
 
 ## Parameters
 
 | Parameter | Type | Default | Description |
-|---|---|---|---|
+|-----------|------|---------|-------------|
 | `parent_smiles` | str | required | SMILES of the parent molecule |
 | `target` | str | — | Descriptor: `HBD`, `HBA`, `AR`, `RotB`, `HA` |
-| `delta` | int | — | Desired change: `+1` or `-1` |
-| `transformation_library` | DataFrame | required | From `load_transformation_library()` |
+| `delta` | int | — | Requested change: `+1` or `-1` |
 | `mode` | str | `None` | Legacy mode string (overrides target/delta) |
-| `max_cuts` | int | `None` | Max attachment points to label |
+| `max_cuts` | int | `None` | Max attachment sites to edit (None = all) |
 | `max_candidates` | int | `10` | Maximum candidates to return |
-| `shuffle_sites` | bool | `False` | Randomize attachment site order |
+| `shuffle_sites` | bool | `False` | Randomize site evaluation order |
 | `random_seed` | int | `None` | Seed for reproducibility |
-| `strict` | bool | `False` | Only return candidates with no non-target descriptor change |
-| `match_mode` | str | `"exact"` | `"exact"` (benchmark) or `"similarity"` (exploratory) |
-| `similarity_threshold` | float | `0.4` | Tanimoto threshold for similarity fallback |
-| `diversity` | bool | `False` | MaxMin diversity selection on final candidates |
+| `strict` | bool | `False` | Only return candidates where no non-target descriptor changes |
+| `diversity` | bool | `False` | Apply MaxMin diversity selection |
 
 ---
 
 ## Result fields
 
+Each dict in the returned list contains:
+
 | Field | Description |
-|---|---|
+|-------|-------------|
 | `parent_smiles` | Canonical SMILES of the parent |
 | `generated_smiles` | Canonical SMILES of the candidate |
 | `target_descriptor` | e.g. `"HBA"` |
-| `requested_delta` | Delta requested by user |
-| `library_delta` | Fragment-level delta from library (retrieval index only) |
-| `actual_delta` | Whole-molecule delta confirmed by RDKit (== `requested_delta`) |
-| `site` | Attachment site, e.g. `"R2"` |
-| `from_fragment` | Source R-group from the library |
-| `to_fragment` | Replacement R-group from the library |
-| `transformation_frequency` | Observed count in source dataset |
-| `transformation_source` | Source label, e.g. `"ChEMBL"` |
-| `match_type` | `"exact"` or `"similarity"` |
-| `match_similarity` | Tanimoto similarity (1.0 for exact) |
+| `requested_delta` | The delta you requested |
+| `actual_delta` | Confirmed by RDKit on the full molecule |
+| `site` | Attachment site label, e.g. `"R1"` |
+| `to_fragment` | Replacement R-group SMILES |
 | `parent_scaffold_smiles` | Murcko scaffold of the parent |
 | `generated_murcko_scaffold` | Murcko scaffold of the generated molecule |
-| `scaffold_preserved` | True if parent scaffold is retained as substructure |
-| `collateral_change` | Sum \|Δ\| for all non-target descriptors |
+| `scaffold_preserved` | `True` if the parent scaffold is a substructure of the candidate |
+| `collateral_change` | Sum of \|Δ\| for all non-target descriptors |
 | `parent_features` | `(HBA, HBD, AR, RotB, HA)` of parent |
 | `generated_features` | `(HBA, HBD, AR, RotB, HA)` of candidate |
 
 ---
 
-## Applicability analysis
+## Current limitations
 
-Use `scripts/compute_applicability.py` to measure library coverage:
-
-```bash
-python scripts/compute_applicability.py \
-    --library transformation_library.csv \
-    --parents benchmark_parents.csv \
-    --smiles-col smiles \
-    --output applicability_summary.csv
-```
-
-For each task, this reports the fraction of benchmark parent molecules for
-which at least one exact-match transformation exists.
-
----
-
-## Tests
-
-```bash
-pip install pytest
-pytest tests/ -v
-```
-
-All 35 tests pass:
-
-| Test class | What is verified |
-|---|---|
-| `TestExactMatchingDefault` | `match_type="exact"` and `match_similarity=1.0` by default |
-| `TestNoSilentSimilarityFallback` | `match_mode="exact"` returns 0 candidates (no fallback) when no exact match |
-| `TestExactDeltaHBA` | All candidates: `generated_HBA - parent_HBA == 1` |
-| `TestExactDeltaHBD` | All candidates: `generated_HBD - parent_HBD == 1` |
-| `TestRotBWholeMolecule` | RotB validated on full molecule; `actual_delta == requested_delta` |
-| `TestScaffoldRetention` | All candidates: `HasSubstructMatch(parent_scaffold)` |
-| `TestStrictMode` | `strict=True`: all non-target descriptors unchanged; `collateral_change == 0` |
-| `TestNoDuplicates` | No duplicate `generated_smiles` in a single call |
-| `TestRemoveArUnsupported` | `AR -1` raises `ValueError` |
-| `TestProvenanceFields` | All required provenance keys present |
-| `TestReproducibility` | Same seed → same results |
-| `TestLoadValidCsv` | Library loading returns correct DataFrame |
-| `TestLoadMissingFile` | `FileNotFoundError` on missing path |
-| `TestLoadMissingRequiredColumns` | `ValueError` on missing columns |
-| `TestOptionalColumnDefaults` | Optional columns filled with defaults |
-| `TestRetrieveExactDelta` | Returns only rows matching delta |
-| `TestRetrieveEmptyWhenNoMatch` | Returns empty DataFrame when no match |
-| `TestLoadCachesResult` | Repeated calls return cached DataFrame |
+- **AR -1** (`remove_ar`) is not supported.  Removing an aromatic ring
+  from a side-chain R-group typically requires modifying the scaffold,
+  which contradicts the scaffold-preservation design.
+- The pool contains 25 R-groups.  Candidates are limited to substitutions
+  at Murcko scaffold attachment points.
+- Molecules without scaffold attachment points (e.g. simple alkanes) return
+  an empty list.
 
 ---
 
@@ -425,21 +230,34 @@ All 35 tests pass:
 scaffold-tuner/
 ├── scaffold_tuner/
 │   ├── __init__.py
-│   └── scaffold_intervention.py   # library: propose_structures() and helpers
-│
-├── scripts/
-│   ├── build_transformation_library.py   # build library from SMILES dataset
-│   └── compute_applicability.py          # exact-match coverage analysis
-│
+│   ├── scaffold_intervention.py   # propose_structures() and helpers
+│   └── rgroup_pool.py             # unified R-group pool (25 entries)
 ├── tests/
-│   ├── conftest.py                        # shared fixtures
-│   ├── test_scaffold_intervention.py      # Tests 1–11
-│   └── test_transformation_library.py     # Tests A–G
-│
+│   ├── conftest.py
+│   ├── test_scaffold_intervention.py
+│   └── test_rgroup_pool.py
 ├── README.md
 ├── requirements.txt
-└── pyproject.toml
+├── pyproject.toml
+└── LICENSE
 ```
+
+---
+
+## Running tests
+
+```bash
+pip install pytest
+pytest
+```
+
+---
+
+## Citation
+
+If you use ScaffoldTuner in your research, please cite:
+
+> [manuscript in preparation]
 
 ---
 

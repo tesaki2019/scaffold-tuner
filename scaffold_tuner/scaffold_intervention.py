@@ -1,63 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-scaffold_intervention.py  –  ScaffoldTuner v2
+scaffold_intervention.py  –  ScaffoldTuner
 
-Primary workflow
-----------------
-    desired descriptor change  (e.g. HBA +1)
-            ↓
-    Step 1: scaffold extraction + R-group decomposition
-            ↓
-    Step 2: iterate over attachment sites
-            ↓
-    Step 3: evaluate all 25 R-groups from the unified pool
-            ↓
-    Step 4: generate candidate molecules
-            ↓
-    Step 5: RDKit sanitization
-            ↓
-    Step 6: parent scaffold retained as substructure
-            generated_mol.HasSubstructMatch(parent_scaffold_mol)
-            ↓
-    Step 7: whole-molecule descriptor recomputation
-            actual_delta = generated_HBA - parent_HBA
-            ↓
-    Step 8: exact requested delta validation
-            actual_delta == requested_delta
-            ↓
-    Step 9: optional strict filtering
-            ↓
-    Step 10: duplicate removal
-            ↓
-    Step 11: ranking (collateral_change ascending, then pool order)
-            ↓
-    Step 12: optional MaxMin diversity selection
-            ↓
-    Top-N candidates with full provenance
+For a given parent molecule (SMILES) and a desired descriptor change
+(target, delta), this module proposes modified candidate structures by:
 
-Design: Unified R-group pool
------------------------------
-All 25 R-groups from rgroup_pool.R_GROUP_SMILES are evaluated as one
-common candidate pool for every request.  There is NO descriptor-specific
-fragment sub-pool.  The selection of candidates that satisfy the requested
-descriptor delta is done entirely by whole-molecule RDKit recomputation
-(Steps 7-8), NOT by pre-filtering based on assumed R-group properties.
+    1. Extracting the Murcko scaffold and R-group sites
+    2. Substituting each of the 25 R-groups from the unified pool
+       at every scaffold attachment point
+    3. Recalculating whole-molecule descriptors with RDKit
+    4. Retaining only candidates where actual_delta == requested_delta
+    5. Optionally enforcing that no other descriptor changes (strict=True)
 
-This means:
-    add_hbd → evaluate all 25 R-groups → keep those with actual ΔHBD = +1
-    add_hba → evaluate all 25 R-groups → keep those with actual ΔHBA = +1
-    ...etc.
+The unified R-group pool contains 25 literature-informed fragments
+(rgroup_pool.R_GROUP_SMILES).  No descriptor-specific sub-pool is used.
 
-remove_ar / AR -1
------------------
-AR -1 raises NotImplementedError.  Removing an aromatic ring from an
-R-group would require modifying the scaffold itself, which contradicts
-the scaffold-retention guarantee.
-
-Scaffold preservation
----------------------
-"Scaffold preserved" means generated_mol.HasSubstructMatch(parent_scaffold).
-This does NOT mean the generated molecule's Murcko scaffold is identical.
+AR -1 (remove_ar) is not supported in the current scaffold-retaining
+workflow and raises NotImplementedError.
 """
 
 from __future__ import annotations
@@ -74,7 +33,7 @@ from .rgroup_pool import R_GROUP_SMILES
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 1.  Descriptor helpers
+# Descriptor helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
 DESCRIPTOR_NAMES = [
@@ -101,6 +60,7 @@ _SUPPORTED: set[tuple[str, int]] = {
     ("HA",  +1), ("HA",  -1),
 }
 
+# Legacy mode strings for backward compatibility
 _MODE_MAP: dict[str, tuple[str, int]] = {
     "add_hbd":    ("HBD",  +1),
     "remove_hbd": ("HBD",  -1),
@@ -125,12 +85,8 @@ def count_features(mol: Chem.Mol) -> tuple[int, ...]:
     )
 
 
-def _morgan_fp(mol: Chem.Mol, radius: int = 2, n_bits: int = 2048):
-    return rdMolDescriptors.GetMorganFingerprintAsBitVect(mol, radius, nBits=n_bits)
-
-
 # ──────────────────────────────────────────────────────────────────────────────
-# 2.  Murcko scaffold and R-group decomposition
+# Scaffold and R-group extraction
 # ──────────────────────────────────────────────────────────────────────────────
 
 def make_murcko_core_with_rlabels(
@@ -139,7 +95,7 @@ def make_murcko_core_with_rlabels(
 ) -> tuple[Chem.Mol, Chem.Mol, Chem.Mol]:
     """
     Extract the Murcko scaffold and label each scaffold–sidechain boundary
-    with [*:N].
+    bond with a dummy atom [*:N].
 
     Returns (parent_mol, scaffold_mol, core_with_attachment_labels).
     """
@@ -182,7 +138,7 @@ def make_murcko_core_with_rlabels(
 
 
 def get_r_labels(core_mol: Chem.Mol) -> list[int]:
-    """Return sorted atom-map numbers of all [*:N] dummy atoms."""
+    """Return sorted attachment-site map numbers from the labeled core."""
     return sorted({
         atom.GetAtomMapNum()
         for atom in core_mol.GetAtoms()
@@ -194,7 +150,7 @@ def get_original_rgroups(
     parent_smiles: str,
     core_with_labels: Chem.Mol,
 ) -> dict[str, str]:
-    """R-group decomposition → {"R1": SMILES, "R2": SMILES, ...}."""
+    """Return {"R1": SMILES, "R2": SMILES, ...} for each attachment site."""
     parent_mol = Chem.MolFromSmiles(parent_smiles)
     if parent_mol is None:
         raise ValueError("Invalid parent SMILES.")
@@ -222,7 +178,7 @@ def get_original_rgroups(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 3.  Fragment attachment
+# Fragment attachment
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _get_dummy_info(
@@ -236,28 +192,26 @@ def _get_dummy_info(
     raise ValueError(f"Dummy atom [*:{map_num}] not found.")
 
 
-def attach_fragment(
+def _attach_fragment(
     scaffold_mol: Chem.Mol,
     fragment_mol: Chem.Mol,
     map_num: int,
 ) -> Chem.Mol:
-    """Join scaffold and fragment at [*:map_num]; remove dummy atoms."""
+    """Join scaffold and fragment at [*:map_num] and return the product."""
     s_dummy, s_nbr, s_bond = _get_dummy_info(scaffold_mol, map_num)
     f_dummy, f_nbr, _      = _get_dummy_info(fragment_mol, map_num)
-
     offset = scaffold_mol.GetNumAtoms()
     emol = Chem.EditableMol(Chem.CombineMols(scaffold_mol, fragment_mol))
     emol.AddBond(s_nbr, f_nbr + offset, order=s_bond)
     for idx in sorted([s_dummy, f_dummy + offset], reverse=True):
         emol.RemoveAtom(idx)
-
     mol = emol.GetMol()
     Chem.SanitizeMol(mol)
     return mol
 
 
-def build_molecule(scaffold_smiles: str, rgroups: dict[str, str]) -> Chem.Mol:
-    """Attach all R-groups to scaffold in ascending site-number order."""
+def _build_molecule(scaffold_smiles: str, rgroups: dict[str, str]) -> Chem.Mol:
+    """Attach all R-groups to the scaffold in ascending site-number order."""
     mol = Chem.MolFromSmiles(scaffold_smiles)
     if mol is None:
         raise ValueError("Invalid scaffold SMILES.")
@@ -265,16 +219,16 @@ def build_molecule(scaffold_smiles: str, rgroups: dict[str, str]) -> Chem.Mol:
         frag = Chem.MolFromSmiles(rgroups[site])
         if frag is None:
             raise ValueError(f"Invalid fragment SMILES: {rgroups[site]}")
-        mol = attach_fragment(mol, frag, int(site[1:]))
+        mol = _attach_fragment(mol, frag, int(site[1:]))
     return mol
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 4.  Unified pool candidate preparation
+# Fragment normalization and pool utilities
 # ──────────────────────────────────────────────────────────────────────────────
 
 def normalize_fragment_smiles(smi: str) -> str:
-    """Canonicalize fragment SMILES; normalize attachment dummy to [*:1]."""
+    """Canonicalize a fragment SMILES; normalize the attachment dummy to [*:1]."""
     mol = Chem.MolFromSmiles(smi)
     if mol is None:
         return smi
@@ -285,10 +239,7 @@ def normalize_fragment_smiles(smi: str) -> str:
 
 
 def _adapt_to_site(pool_smi: str, map_num: int) -> str:
-    """
-    Replace the attachment dummy in a pool SMILES (uses [*:1]) with
-    [*:map_num] so it fits a specific scaffold attachment site.
-    """
+    """Replace the [*:1] dummy in a pool SMILES with [*:map_num]."""
     mol = Chem.MolFromSmiles(pool_smi)
     if mol is None:
         raise ValueError(f"Invalid pool SMILES: {pool_smi}")
@@ -298,35 +249,8 @@ def _adapt_to_site(pool_smi: str, map_num: int) -> str:
     return Chem.MolToSmiles(mol)
 
 
-def _build_pool_candidates(
-    pool: tuple[str, ...],
-    label: int,
-    core_smiles: str,
-    original_rgroups: dict[str, str],
-) -> list[tuple[str, str]]:
-    """
-    For one attachment site, generate (pool_smi, candidate_smiles) pairs
-    by substituting each pool entry at that site.
-
-    Returns only entries that pass RDKit sanitization.
-    pool_smi is normalized to [*:1]; candidate_smiles is the full molecule.
-    """
-    site = f"R{label}"
-    results = []
-    for pool_smi in pool:
-        try:
-            adapted = _adapt_to_site(pool_smi, label)
-            rgroups = {**original_rgroups, site: adapted}
-            gen_mol = build_molecule(core_smiles, rgroups)
-            gen_canon = Chem.MolToSmiles(gen_mol)
-            results.append((normalize_fragment_smiles(pool_smi), gen_canon))
-        except Exception:
-            continue
-    return results
-
-
 # ──────────────────────────────────────────────────────────────────────────────
-# 5.  Shared R-group extraction utility
+# Public utility: R-group extraction (shared with evaluation scripts)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def extract_rgroups_for_smiles(
@@ -334,29 +258,23 @@ def extract_rgroups_for_smiles(
     max_cuts: Optional[int] = None,
 ) -> list[str] | None:
     """
-    Public utility: extract and normalize R-group SMILES for a parent molecule.
+    Extract and normalize the R-group SMILES for a parent molecule.
 
-    Shared by propose_structures() (generation) and compute_applicability.py
-    (evaluation).  Using the same function in both places guarantees that
-    the R-group definition is identical.
-
-    Returns list of normalized R-group SMILES (attachment dummy = [*:1]),
-    or None on any failure.
+    Returns a list of normalized R-group SMILES (attachment dummy = [*:1]),
+    or None if extraction fails for any reason.
     """
     try:
         _, _, core = make_murcko_core_with_rlabels(parent_smiles, max_cuts=max_cuts)
         rgroups    = get_original_rgroups(parent_smiles, core)
     except Exception:
         return None
-
     if not rgroups:
         return None
-
     return [normalize_fragment_smiles(smi) for smi in rgroups.values()]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 6.  Candidate ranking
+# Ranking and diversity selection
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _collateral_change(
@@ -364,29 +282,13 @@ def _collateral_change(
     gen_feats: tuple[int, ...],
     target_idx: int,
 ) -> int:
-    """Sum |Δ| for all non-target descriptors (lower = fewer side-effects)."""
+    """Sum of |Δ| for all non-target descriptors."""
     return sum(
         abs(gen_feats[i] - parent_feats[i])
         for i in range(len(parent_feats))
         if i != target_idx
     )
 
-
-def _rank_candidates(candidates: list[dict], target_idx: int) -> list[dict]:
-    """
-    Sort by:
-        1. collateral_change ascending
-        2. pool_index ascending  (original pool order as tiebreaker)
-    """
-    return sorted(
-        candidates,
-        key=lambda c: (c["collateral_change"], c.get("_pool_index", 0)),
-    )
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 7.  Diversity-aware MaxMin selection
-# ──────────────────────────────────────────────────────────────────────────────
 
 def _maxmin_select(
     candidates: list[dict],
@@ -396,7 +298,7 @@ def _maxmin_select(
 ) -> list[dict]:
     """
     Select up to *n* structurally diverse candidates using MaxMin on
-    Morgan fingerprints.  Applied AFTER all filtering and ranking.
+    Morgan fingerprints.  Applied after all filtering and ranking.
     """
     if len(candidates) <= n:
         return candidates
@@ -415,7 +317,6 @@ def _maxmin_select(
 
     selected_vi = [0]
     remaining_vi = list(range(1, len(valid_indices)))
-
     while len(selected_vi) < n and remaining_vi:
         best_vi, best_min_dist = None, -1.0
         for vi in remaining_vi:
@@ -434,63 +335,49 @@ def _maxmin_select(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 8.  Main API
+# Main API
 # ──────────────────────────────────────────────────────────────────────────────
 
 def propose_structures(
     parent_smiles: str,
-    # primary API
     target: Optional[str] = None,
     delta: Optional[int] = None,
-    # legacy API
-    mode: Optional[str] = None,
-    # shared options
+    mode: Optional[str] = None,       # legacy mode string
     max_cuts: Optional[int] = None,
     max_candidates: int = 10,
     shuffle_sites: bool = False,
     random_seed: Optional[int] = None,
     strict: bool = False,
-    # diversity
     diversity: bool = False,
 ) -> list[dict]:
     """
-    Propose candidate structures using the unified R-group pool.
+    Propose candidate structures in which one molecular descriptor changes
+    by exactly *delta* units.
 
-    All 25 R-groups from rgroup_pool.R_GROUP_SMILES are evaluated at each
-    scaffold attachment site.  Candidates are accepted only if the
-    whole-molecule RDKit descriptor satisfies:
+    All 25 R-groups from the unified pool (rgroup_pool.R_GROUP_SMILES) are
+    evaluated at every scaffold attachment site.  Candidates are accepted
+    only when the whole-molecule RDKit descriptor satisfies:
 
         actual_delta == requested_delta
 
-    No descriptor-specific fragment sub-pool is used.
-
-    Primary API (v2)
-    ----------------
-    propose_structures(
-        parent_smiles,
-        target="HBA",   # HBD | HBA | AR | RotB | HA
-        delta=1,        # +1 or -1  (AR: +1 only)
-    )
-
-    Legacy API (backward-compatible)
-    ---------------------------------
-    propose_structures(parent_smiles, mode="add_hba")
-
     Parameters
     ----------
-    target         : descriptor — HBD, HBA, AR, RotB, HA
-    delta          : desired change (+1 or -1; AR supports +1 only)
-    mode           : legacy mode string (overrides target/delta)
-    max_cuts       : max attachment points (None = all)
-    max_candidates : maximum candidates to return
-    shuffle_sites  : randomize attachment site order
+    parent_smiles  : SMILES of the parent molecule
+    target         : descriptor to change — HBD, HBA, AR, RotB, or HA
+    delta          : requested change — +1 or -1 (AR supports +1 only)
+    mode           : legacy mode string, e.g. "add_hba" (overrides target/delta)
+    max_cuts       : maximum number of R-group sites to edit (None = all)
+    max_candidates : maximum number of candidates to return
+    shuffle_sites  : randomize site evaluation order (requires random_seed)
     random_seed    : seed for reproducibility
-    strict         : if True, all non-target descriptors must be unchanged
-    diversity      : if True, apply MaxMin selection on final candidates
+    strict         : if True, only return candidates where no non-target
+                     descriptor changes
+    diversity      : if True, apply MaxMin diversity selection on the
+                     final candidate set
 
     Returns
     -------
-    List of dicts; each contains:
+    List of dicts, each with:
         parent_smiles, generated_smiles,
         target_descriptor, requested_delta, actual_delta,
         site, to_fragment,
@@ -502,8 +389,8 @@ def propose_structures(
     if mode is not None and target is None:
         if mode == "remove_ar":
             raise NotImplementedError(
-                "Aromatic-ring removal is reserved for future transformation "
-                "backends and is not supported in the current scaffold-retaining workflow."
+                "Aromatic-ring removal is reserved for future workflow backends "
+                "and is not supported in the current scaffold-retaining implementation."
             )
         if mode not in _MODE_MAP:
             raise ValueError(
@@ -515,20 +402,19 @@ def propose_structures(
     if target is None or delta is None:
         raise ValueError(
             "Specify target+delta (e.g. target='HBA', delta=1) "
-            "or the legacy mode string (e.g. mode='add_hba')."
+            "or a legacy mode string (e.g. mode='add_hba')."
         )
 
-    # ── validate (target, delta) ─────────────────────────────────────────────
     if target == "AR" and delta == -1:
         raise NotImplementedError(
-            "Aromatic-ring removal is reserved for future transformation "
-            "backends and is not supported in the current scaffold-retaining workflow."
+            "Aromatic-ring removal is reserved for future workflow backends "
+            "and is not supported in the current scaffold-retaining implementation."
         )
 
     if (target, delta) not in _SUPPORTED:
         raise ValueError(
             f"Unsupported (target, delta) = ({target!r}, {delta}). "
-            f"Supported: {sorted(_SUPPORTED)}."
+            f"Supported combinations: {sorted(_SUPPORTED)}."
         )
 
     target_idx = _DESC_INDEX[target]
@@ -536,7 +422,7 @@ def propose_structures(
     if random_seed is not None:
         random.seed(random_seed)
 
-    # ── scaffold / R-group decomposition ─────────────────────────────────────
+    # ── scaffold and R-group extraction ──────────────────────────────────────
     parent_mol, scaffold_mol, core = make_murcko_core_with_rlabels(
         parent_smiles, max_cuts=max_cuts
     )
@@ -553,34 +439,29 @@ def propose_structures(
     if shuffle_sites:
         labels = random.sample(labels, len(labels))
 
-    # ── pool to use (always the full unified pool) ────────────────────────────
-    pool = R_GROUP_SMILES   # tuple of 25 SMILES from rgroup_pool.py
-
-    # ── generation + validation loop ─────────────────────────────────────────
+    # ── candidate generation and validation ───────────────────────────────────
     all_candidates: list[dict] = []
     seen: set[str] = set()
 
     for label in labels:
         site = f"R{label}"
-        # Generate candidates by substituting each pool entry at this site
-        for pool_idx, pool_smi in enumerate(pool):
+        for pool_idx, pool_smi in enumerate(R_GROUP_SMILES):
             try:
-                adapted    = _adapt_to_site(pool_smi, label)
-                rgroups    = {**original_rgroups, site: adapted}
-                gen_mol    = build_molecule(core_smiles, rgroups)
-                gen_canon  = Chem.MolToSmiles(gen_mol)
+                adapted   = _adapt_to_site(pool_smi, label)
+                rgroups   = {**original_rgroups, site: adapted}
+                gen_mol   = _build_molecule(core_smiles, rgroups)
+                gen_canon = Chem.MolToSmiles(gen_mol)
             except Exception:
                 continue
 
             if gen_canon == parent_canon or gen_canon in seen:
                 continue
 
-            # Step 6: parent scaffold retained as substructure
-            scaffold_preserved = bool(gen_mol.HasSubstructMatch(scaffold_mol))
-            if not scaffold_preserved:
+            # Scaffold retention check
+            if not gen_mol.HasSubstructMatch(scaffold_mol):
                 continue
 
-            # Step 7: whole-molecule descriptor recomputation
+            # Whole-molecule descriptor recomputation
             gen_feats = count_features(gen_mol)
 
             gen_scaffold_mol = MurckoScaffold.GetScaffoldForMol(gen_mol)
@@ -589,25 +470,22 @@ def propose_structures(
                 if gen_scaffold_mol is not None else ""
             )
 
-            # Step 8: exact requested delta validation (whole molecule only)
+            # Exact delta validation (whole molecule)
             actual_delta = gen_feats[target_idx] - parent_feats[target_idx]
             if actual_delta != delta:
                 continue
 
-            # Step 9: strict filtering
-            other_unchanged = all(
-                gen_feats[i] == parent_feats[i]
+            # Strict mode: no other descriptor may change
+            if strict and any(
+                gen_feats[i] != parent_feats[i]
                 for i in range(len(parent_feats))
                 if i != target_idx
-            )
-            if strict and not other_unchanged:
+            ):
                 continue
 
-            # Step 10: duplicate removal
             seen.add(gen_canon)
 
             collateral = _collateral_change(parent_feats, gen_feats, target_idx)
-
             all_candidates.append({
                 "parent_smiles":             parent_canon,
                 "generated_smiles":          gen_canon,
@@ -618,40 +496,38 @@ def propose_structures(
                 "to_fragment":               normalize_fragment_smiles(pool_smi),
                 "parent_scaffold_smiles":    parent_scaffold_smi,
                 "generated_murcko_scaffold": gen_scaffold_smi,
-                "scaffold_preserved":        scaffold_preserved,
+                "scaffold_preserved":        True,
                 "collateral_change":         collateral,
                 "parent_features":           parent_feats,
                 "generated_features":        gen_feats,
-                "_pool_index":               pool_idx,  # internal; for ranking
+                "_pool_index":               pool_idx,
             })
 
     if not all_candidates:
         return []
 
-    # Step 11: ranking
-    ranked = _rank_candidates(all_candidates, target_idx)
-
-    # Remove internal ranking key before returning
+    # Ranking: collateral_change ascending, then pool order
+    ranked = sorted(
+        all_candidates,
+        key=lambda c: (c["collateral_change"], c["_pool_index"]),
+    )
     for rec in ranked:
-        rec.pop("_pool_index", None)
+        rec.pop("_pool_index")
 
-    # Step 12: optional diversity selection
     if diversity:
         return _maxmin_select(ranked, max_candidates)
-
     return ranked[:max_candidates]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 9.  Display helper
+# Display helper
 # ──────────────────────────────────────────────────────────────────────────────
 
 def print_proposals(results: list[dict]) -> None:
-    """Pretty-print results from propose_structures()."""
+    """Pretty-print the list returned by propose_structures()."""
     if not results:
         print("No valid candidates found.")
         return
-
     for i, rec in enumerate(results, start=1):
         print(f"=== Candidate {i} ===")
         print(
@@ -661,11 +537,8 @@ def print_proposals(results: list[dict]) -> None:
             f"site: {rec['site']}  "
             f"collateral: {rec['collateral_change']}"
         )
-        print(f"to_fragment: {rec['to_fragment']}")
-        print(
-            f"scaffold_preserved: {rec['scaffold_preserved']}  "
-            f"parent scaffold: {rec['parent_scaffold_smiles']}"
-        )
+        print(f"to_fragment      : {rec['to_fragment']}")
+        print(f"scaffold_preserved: {rec['scaffold_preserved']}")
         print(f"parent   : {rec['parent_smiles']}")
         print(f"generated: {rec['generated_smiles']}")
         print(f"features {DESCRIPTOR_NAMES}")
@@ -675,7 +548,7 @@ def print_proposals(results: list[dict]) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 10.  Version
+# Version
 # ──────────────────────────────────────────────────────────────────────────────
 
 from scaffold_tuner import __version__  # noqa: E402
