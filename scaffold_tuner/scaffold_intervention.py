@@ -249,6 +249,81 @@ def _adapt_to_site(pool_smi: str, map_num: int) -> str:
     return Chem.MolToSmiles(mol)
 
 
+def _rgroup_sub_substitutions(
+    rgroup_smi: str,
+    pool: tuple[str, ...],
+) -> list[str]:
+    """
+    Generate R-group variants by grafting each pool entry onto every
+    carbon within the R-group that carries at least one implicit hydrogen.
+
+    This enables modifications *inside* an existing R-group side-chain
+    (e.g. -CH2- → -CH(pyrrolyl)-) rather than replacing the entire
+    R-group.  The attachment-point dummy atom ([*:N] with any map number)
+    is preserved unchanged in all returned SMILES.
+
+    Returns a list of unique canonical SMILES for the modified R-groups.
+    The map number on the attachment dummy is whatever was in rgroup_smi.
+    """
+    mol = Chem.MolFromSmiles(rgroup_smi)
+    if mol is None:
+        return []
+
+    # Find the attachment-point dummy and its map number
+    attachment_map = None
+    for atom in mol.GetAtoms():
+        if atom.GetAtomicNum() == 0:
+            attachment_map = atom.GetAtomMapNum()
+            break
+
+    seen: set[str] = set()
+    results: list[str] = []
+
+    for carbon in mol.GetAtoms():
+        # Only substitute at carbons that have at least one implicit H
+        if carbon.GetAtomicNum() != 6 or carbon.GetTotalNumHs() < 1:
+            continue
+        carbon_idx = carbon.GetIdx()
+
+        for pool_smi in pool:
+            pool_mol = Chem.MolFromSmiles(pool_smi)
+            if pool_mol is None:
+                continue
+
+            # Find dummy and its neighbor in the pool fragment
+            pool_dummy_idx = None
+            for a in pool_mol.GetAtoms():
+                if a.GetAtomicNum() == 0:
+                    pool_dummy_idx = a.GetIdx()
+                    break
+            if pool_dummy_idx is None:
+                continue
+
+            pool_nbr_idx = pool_mol.GetAtomWithIdx(pool_dummy_idx).GetNeighbors()[0].GetIdx()
+
+            try:
+                from rdkit.Chem import RWMol
+                combined = RWMol(Chem.CombineMols(mol, pool_mol))
+                offset = mol.GetNumAtoms()
+                # Bond: carbon in rgroup → neighbor of dummy in pool
+                combined.AddBond(
+                    carbon_idx,
+                    pool_nbr_idx + offset,
+                    Chem.rdchem.BondType.SINGLE,
+                )
+                # Remove the pool's dummy atom (now connected through its neighbor)
+                combined.RemoveAtom(pool_dummy_idx + offset)
+                Chem.SanitizeMol(combined)
+                smi = Chem.MolToSmiles(combined.GetMol())
+                if smi not in seen:
+                    seen.add(smi)
+                    results.append(smi)
+            except Exception:
+                continue
+
+    return results
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Public utility: R-group extraction (shared with evaluation scripts)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -445,9 +520,35 @@ def propose_structures(
 
     for label in labels:
         site = f"R{label}"
-        for pool_idx, pool_smi in enumerate(R_GROUP_SMILES):
+        current_rgroup = original_rgroups.get(site, "")
+
+        # Build the full list of (adapted_rgroup_smi, to_fragment_label, sort_key)
+        # to try at this site.
+        #
+        # Tier 1 — direct pool replacement:
+        #   Swap the entire R-group for each of the 25 pool entries.
+        #   This is the original behaviour.
+        #
+        # Tier 2 — sub-substitution inside the existing R-group:
+        #   Graft each pool entry onto every substitutable carbon *within*
+        #   the current R-group, producing modified R-groups such as
+        #   NCC(=O)N[*:1] → NC(c1ccc[nH]1)C(=O)N[*:1].
+        #   This allows changes *inside* a side-chain, not just at its root.
+        tier1 = [
+            (_adapt_to_site(smi, label), normalize_fragment_smiles(smi), i)
+            for i, smi in enumerate(R_GROUP_SMILES)
+        ]
+        tier2_rgroups = (
+            _rgroup_sub_substitutions(current_rgroup, R_GROUP_SMILES)
+            if current_rgroup else []
+        )
+        tier2 = [
+            (s, normalize_fragment_smiles(s), len(R_GROUP_SMILES) + i)
+            for i, s in enumerate(tier2_rgroups)
+        ]
+
+        for adapted, to_frag_label, sort_key in tier1 + tier2:
             try:
-                adapted   = _adapt_to_site(pool_smi, label)
                 rgroups   = {**original_rgroups, site: adapted}
                 gen_mol   = _build_molecule(core_smiles, rgroups)
                 gen_canon = Chem.MolToSmiles(gen_mol)
@@ -493,14 +594,14 @@ def propose_structures(
                 "requested_delta":           delta,
                 "actual_delta":              actual_delta,
                 "site":                      site,
-                "to_fragment":               normalize_fragment_smiles(pool_smi),
+                "to_fragment":               to_frag_label,
                 "parent_scaffold_smiles":    parent_scaffold_smi,
                 "generated_murcko_scaffold": gen_scaffold_smi,
                 "scaffold_preserved":        True,
                 "collateral_change":         collateral,
                 "parent_features":           parent_feats,
                 "generated_features":        gen_feats,
-                "_pool_index":               pool_idx,
+                "_pool_index":               sort_key,
             })
 
     if not all_candidates:

@@ -231,12 +231,19 @@ class TestResultFields:
         for r in results:
             assert "_pool_index" not in r
 
-    def test_to_fragment_in_pool(self, parent_methyl):
-        pool_set = {normalize_fragment_smiles(s) for s in R_GROUP_SMILES}
+    def test_to_fragment_is_valid_smiles(self, parent_methyl):
+        """
+        to_fragment is either a direct pool entry or a sub-substituted variant
+        of the parent R-group (with a pool entry grafted inside it).
+        Either way it must be a valid, non-empty SMILES string.
+        """
+        from rdkit import Chem
         results = propose_structures(parent_methyl, target="HBA", delta=1,
                                      max_candidates=25)
         for r in results:
-            assert r["to_fragment"] in pool_set
+            assert isinstance(r["to_fragment"], str) and len(r["to_fragment"]) > 0
+            mol = Chem.MolFromSmiles(r["to_fragment"])
+            assert mol is not None, f"Invalid to_fragment SMILES: {r['to_fragment']}"
 
 
 # ── extract_rgroups_for_smiles ────────────────────────────────────────────────
