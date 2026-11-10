@@ -124,12 +124,6 @@ comparisons, because it weakens the traceability to observed transformations.
 | `HA`  | +1 | `add_ha` | Increase number of heteroatoms |
 | `HA`  | -1 | `remove_ha` | Decrease number of heteroatoms |
 
-### Not supported
-
-| target | delta | Reason |
-|---|---|---|
-| `AR` | -1 | Removing an aromatic ring from an R-group requires modifying the scaffold. Raises `ValueError`. |
-
 ---
 
 ## Requirements
@@ -406,7 +400,6 @@ All 35 tests pass:
 | `TestScaffoldRetention` | All candidates: `HasSubstructMatch(parent_scaffold)` |
 | `TestStrictMode` | `strict=True`: all non-target descriptors unchanged; `collateral_change == 0` |
 | `TestNoDuplicates` | No duplicate `generated_smiles` in a single call |
-| `TestRemoveArUnsupported` | `AR -1` raises `ValueError` |
 | `TestProvenanceFields` | All required provenance keys present |
 | `TestReproducibility` | Same seed → same results |
 | `TestLoadValidCsv` | Library loading returns correct DataFrame |

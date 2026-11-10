@@ -346,12 +346,12 @@ class TestNoDuplicates:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Test 9: remove_ar unsupported
+# Test 9: reserved future transformation remains unavailable in current backend
 # ──────────────────────────────────────────────────────────────────────────────
 
 class TestRemoveArUnsupported:
     def test_target_ar_delta_minus1_raises(self, parent_methyl, minimal_library):
-        with pytest.raises(ValueError, match="remove_ar"):
+        with pytest.raises(NotImplementedError, match="future transformation"):
             propose_structures(
                 parent_methyl,
                 target="AR", delta=-1,
@@ -359,7 +359,7 @@ class TestRemoveArUnsupported:
             )
 
     def test_mode_remove_ar_raises(self, parent_methyl, minimal_library):
-        with pytest.raises(ValueError):
+        with pytest.raises(NotImplementedError, match="future transformation"):
             propose_structures(
                 parent_methyl,
                 mode="remove_ar",

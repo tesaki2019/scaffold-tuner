@@ -52,10 +52,6 @@ Scaffold preservation
 This does NOT mean the generated molecule's Murcko scaffold is identical to
 the parent's.  The parent scaffold is *retained as a substructure*.
 
-remove_ar
----------
-AR -1 is intentionally unsupported.  Removing an aromatic ring from an
-R-group would require modifying the scaffold itself.
 """
 
 from __future__ import annotations
@@ -109,6 +105,14 @@ _MODE_MAP: dict[str, tuple[str, int]] = {
     "remove_rb":  ("RotB", -1),
     "add_ha":     ("HA",   +1),
     "remove_ha":  ("HA",   -1),
+}
+
+# Reserved internal mode names for future transformation backends.
+# These are intentionally NOT exposed as supported modes in the public API
+# or README.  They preserve a stable extension point for future backends
+# (for example, scaffold-level or CReM-derived transformation rules).
+_RESERVED_FUTURE_MODES: dict[str, tuple[str, int]] = {
+    "remove_ar": ("AR", -1),
 }
 
 
@@ -639,11 +643,15 @@ def propose_structures(
     """
     # ── resolve target / delta ────────────────────────────────────────────────
     if mode is not None and target is None:
+        if mode in _RESERVED_FUTURE_MODES:
+            raise NotImplementedError(
+                "This transformation is reserved for a future transformation "
+                "backend and is not supported in the current scaffold-retaining workflow."
+            )
         if mode not in _MODE_MAP:
             raise ValueError(
                 f"Unknown mode '{mode}'. "
-                f"Supported modes: {sorted(_MODE_MAP.keys())}. "
-                "Note: 'remove_ar' is not supported in v2."
+                f"Supported modes: {sorted(_MODE_MAP.keys())}."
             )
         target, delta = _MODE_MAP[mode]
 
@@ -655,10 +663,9 @@ def propose_structures(
 
     if (target, delta) not in _SUPPORTED:
         if target == "AR" and delta == -1:
-            raise ValueError(
-                "AR -1 (remove_ar) is not supported in v2. "
-                "Removing an aromatic ring from an R-group contradicts "
-                "the parent scaffold retention guarantee."
+            raise NotImplementedError(
+                "This transformation is reserved for a future transformation "
+                "backend and is not supported in the current scaffold-retaining workflow."
             )
         raise ValueError(
             f"Unsupported (target, delta) = ({target!r}, {delta}). "
