@@ -1,20 +1,233 @@
 # -*- coding: utf-8 -*-
+"""
+scaffold_intervention.py  –  ScaffoldTuner v2
+
+Primary workflow
+----------------
+    desired descriptor change  (e.g. HBA +1)
+            ↓
+    Step 1: descriptor-indexed retrieval
+            library[delta_HBA == +1]   ← fragment-level pre-filter only
+            ↓
+    Step 2: exact R-group match  (default; match_mode="exact")
+            parent R-group == from_fragment  (canonical SMILES)
+            ↓
+    Step 3: candidate generation
+            ↓
+    Step 4: RDKit sanitization  (inside build_molecule)
+            ↓
+    Step 5: parent scaffold retained as substructure
+            generated_mol.HasSubstructMatch(parent_scaffold_mol)
+            ↓
+    Step 6: whole-molecule descriptor recomputation (RDKit)
+            actual_delta = generated_HBA - parent_HBA
+            ↓
+    Step 7: exact requested delta validation
+            actual_delta == requested_delta
+            ↓
+    Step 8: optional strict filtering
+            ↓
+    Step 9: ranking (collateral_change → match type → frequency)
+            ↓
+    Step 10: optional MaxMin diversity selection
+            ↓
+    Top-N candidates with full provenance
+
+Key difference from CReM
+-------------------------
+CReM indexes replacements by local chemical context (ECFP-like radius).
+ScaffoldTuner v2 indexes by *desired descriptor delta*:
+
+    desired delta → retrieve matching transformations → exact R-group match
+    → generate → whole-molecule exact validation
+
+Similarity-based matching
+--------------------------
+match_mode="similarity" is an *optional exploratory mode only*.
+It must NOT be used in benchmark comparisons.
+
+Scaffold preservation
+---------------------
+"Scaffold preserved" means generated_mol.HasSubstructMatch(parent_scaffold).
+This does NOT mean the generated molecule's Murcko scaffold is identical to
+the parent's.  The parent scaffold is *retained as a substructure*.
+
+remove_ar
+---------
+AR -1 is intentionally unsupported.  Removing an aromatic ring from an
+R-group would require modifying the scaffold itself.
+"""
+
+from __future__ import annotations
+
 import random
-from rdkit import Chem
-from rdkit.Chem import Lipinski, Descriptors, rdRGroupDecomposition
+from pathlib import Path
+from typing import Optional, Union
+
+import pandas as pd
+from rdkit import Chem, DataStructs
+from rdkit.Chem import Descriptors, Lipinski, rdRGroupDecomposition
+from rdkit.Chem import rdMolDescriptors
 from rdkit.Chem.Scaffolds import MurckoScaffold
 
 
-# ──────────────────────────────────────────────
-# 1. Parent molecule → Murcko core with R-group labels
-# ──────────────────────────────────────────────
-def make_murcko_core_with_rlabels(parent_smiles, max_cuts=None):
-    """
-    Generate the Murcko scaffold from the parent molecule SMILES and
-    return the core with attachment point labels [*:1], [*:2], ... at
-    each scaffold-sidechain boundary.
+# ──────────────────────────────────────────────────────────────────────────────
+# 1.  Descriptor helpers
+# ──────────────────────────────────────────────────────────────────────────────
 
-    Returns: (parent_mol, scaffold_mol, core_with_labels)
+DESCRIPTOR_NAMES = [
+    "NumHAcceptors",
+    "NumHDonors",
+    "NumAromaticRings",
+    "NumRotatableBonds",
+    "NumHeteroatoms",
+]
+
+_DESC_INDEX: dict[str, int] = {
+    "HBA":  0,
+    "HBD":  1,
+    "AR":   2,
+    "RotB": 3,
+    "HA":   4,
+}
+
+_SUPPORTED: set[tuple[str, int]] = {
+    ("HBD", +1), ("HBD", -1),
+    ("HBA", +1), ("HBA", -1),
+    ("AR",  +1),
+    ("RotB",+1), ("RotB",-1),
+    ("HA",  +1), ("HA",  -1),
+}
+
+_MODE_MAP: dict[str, tuple[str, int]] = {
+    "add_hbd":    ("HBD",  +1),
+    "remove_hbd": ("HBD",  -1),
+    "add_hba":    ("HBA",  +1),
+    "remove_hba": ("HBA",  -1),
+    "add_ar":     ("AR",   +1),
+    "add_rb":     ("RotB", +1),
+    "remove_rb":  ("RotB", -1),
+    "add_ha":     ("HA",   +1),
+    "remove_ha":  ("HA",   -1),
+}
+
+
+def count_features(mol: Chem.Mol) -> tuple[int, ...]:
+    """Return (HBA, HBD, NumAromaticRings, NumRotatableBonds, NumHeteroatoms)."""
+    return (
+        Lipinski.NumHAcceptors(mol),
+        Lipinski.NumHDonors(mol),
+        Descriptors.NumAromaticRings(mol),
+        Descriptors.NumRotatableBonds(mol),
+        Descriptors.NumHeteroatoms(mol),
+    )
+
+
+def _morgan_fp(mol: Chem.Mol, radius: int = 2, n_bits: int = 2048):
+    return rdMolDescriptors.GetMorganFingerprintAsBitVect(mol, radius, nBits=n_bits)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 2.  Transformation library
+# ──────────────────────────────────────────────────────────────────────────────
+
+_REQUIRED_COLS: set[str] = {
+    "from_fragment", "to_fragment",
+    "delta_HBD", "delta_HBA", "delta_AR", "delta_RotB",
+}
+
+_LIB_CACHE: dict[str, pd.DataFrame] = {}
+
+
+def load_transformation_library(path: Union[str, Path]) -> pd.DataFrame:
+    """
+    Load a transformation library from a CSV, TSV, or Parquet file.
+
+    Required columns
+    ----------------
+    from_fragment, to_fragment,
+    delta_HBD, delta_HBA, delta_AR, delta_RotB
+
+    Optional columns (auto-filled with defaults if absent)
+    -------------------------------------------------------
+    delta_HA   (default 0)
+    frequency  (default 1)
+    source     (default "unknown")
+
+    IMPORTANT: delta_* are fragment-level values used as a retrieval
+    pre-filter only.  The final acceptance criterion is the whole-molecule
+    actual_delta recomputed by RDKit after generation.
+    """
+    key = str(path)
+    if key in _LIB_CACHE:
+        return _LIB_CACHE[key]
+
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Transformation library not found: {path}")
+
+    suffix = p.suffix.lower()
+    if suffix == ".csv":
+        df = pd.read_csv(p)
+    elif suffix in (".tsv", ".txt"):
+        df = pd.read_csv(p, sep="\t")
+    elif suffix == ".parquet":
+        df = pd.read_parquet(p)
+    else:
+        raise ValueError(
+            f"Unsupported file format '{suffix}'. Use .csv, .tsv, or .parquet."
+        )
+
+    missing = _REQUIRED_COLS - set(df.columns)
+    if missing:
+        raise ValueError(
+            f"Transformation library is missing required columns: {missing}"
+        )
+
+    for col, default in [("delta_HA", 0), ("frequency", 1)]:
+        if col not in df.columns:
+            df[col] = default
+    if "source" not in df.columns:
+        df["source"] = "unknown"
+
+    for col in ["delta_HBD", "delta_HBA", "delta_AR", "delta_RotB",
+                "delta_HA", "frequency"]:
+        df[col] = df[col].fillna(0).astype(int)
+
+    _LIB_CACHE[key] = df
+    return df
+
+
+def retrieve_transformations(
+    library: pd.DataFrame,
+    target: str,
+    delta: int,
+) -> pd.DataFrame:
+    """
+    Step 1: descriptor-indexed retrieval.
+
+    Return library rows whose fragment-level delta for *target* equals *delta*.
+    This is a pre-filter only; whole-molecule validation happens in Steps 6-7.
+    """
+    col = f"delta_{target}"
+    if col not in library.columns:
+        raise ValueError(f"Column '{col}' not found in transformation library.")
+    return library[library[col] == delta].copy()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 3.  Murcko scaffold and R-group decomposition
+# ──────────────────────────────────────────────────────────────────────────────
+
+def make_murcko_core_with_rlabels(
+    parent_smiles: str,
+    max_cuts: Optional[int] = None,
+) -> tuple[Chem.Mol, Chem.Mol, Chem.Mol]:
+    """
+    Extract the Murcko scaffold and label each scaffold–sidechain boundary
+    with [*:N].
+
+    Returns (parent_mol, scaffold_mol, core_with_attachment_labels).
     """
     parent_mol = Chem.MolFromSmiles(parent_smiles)
     if parent_mol is None:
@@ -28,13 +241,10 @@ def make_murcko_core_with_rlabels(parent_smiles, max_cuts=None):
     if not matches:
         raise ValueError("Murcko scaffold did not match the parent molecule.")
 
-    # Atom indices in the parent molecule that belong to the scaffold,
-    # and a reverse mapping from parent index to scaffold index
     match = matches[0]
     core_atom_idxs = set(match)
     parent_to_core = {p: c for c, p in enumerate(match)}
 
-    # Collect bonds that cross the scaffold-sidechain boundary
     boundary_bonds = [
         b for b in parent_mol.GetBonds()
         if (b.GetBeginAtomIdx() in core_atom_idxs) ^ (b.GetEndAtomIdx() in core_atom_idxs)
@@ -42,14 +252,12 @@ def make_murcko_core_with_rlabels(parent_smiles, max_cuts=None):
     if max_cuts is not None:
         boundary_bonds = boundary_bonds[:max_cuts]
 
-    # For each boundary bond, add a dummy atom [*:N] to the scaffold-side atom
     rw_core = Chem.RWMol(scaffold_mol)
     for rlabel, bond in enumerate(boundary_bonds, start=1):
         a1, a2 = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
         core_parent_idx = a1 if a1 in core_atom_idxs else a2
         core_idx = parent_to_core[core_parent_idx]
-
-        dummy = Chem.Atom(0)          # dummy atom *
+        dummy = Chem.Atom(0)
         dummy.SetAtomMapNum(rlabel)
         dummy_idx = rw_core.AddAtom(dummy)
         rw_core.AddBond(core_idx, dummy_idx, bond.GetBondType())
@@ -59,22 +267,8 @@ def make_murcko_core_with_rlabels(parent_smiles, max_cuts=None):
     return parent_mol, scaffold_mol, core_with_labels
 
 
-# ──────────────────────────────────────────────
-# 2. Utilities
-# ──────────────────────────────────────────────
-def count_features(mol):
-    """Return a tuple of (HBA, HBD, NumAromaticRings, NumRotatableBonds, NumHeteroatoms)."""
-    return (
-        Lipinski.NumHAcceptors(mol),
-        Lipinski.NumHDonors(mol),
-        Descriptors.NumAromaticRings(mol),
-        Descriptors.NumRotatableBonds(mol),
-        Descriptors.NumHeteroatoms(mol),
-    )
-
-
-def get_r_labels(core_mol):
-    """Return a sorted list of atom map numbers for all dummy atoms [*:N] in the core."""
+def get_r_labels(core_mol: Chem.Mol) -> list[int]:
+    """Return sorted atom-map numbers of all [*:N] dummy atoms."""
     return sorted({
         atom.GetAtomMapNum()
         for atom in core_mol.GetAtoms()
@@ -82,14 +276,11 @@ def get_r_labels(core_mol):
     })
 
 
-# ──────────────────────────────────────────────
-# 3. Extract the original R-groups from the parent molecule
-# ──────────────────────────────────────────────
-def get_original_rgroups(parent_smiles, core_with_labels):
-    """
-    Perform R-group decomposition on the parent molecule and return
-    each substituent as {"R1": SMILES, "R2": SMILES, ...}.
-    """
+def get_original_rgroups(
+    parent_smiles: str,
+    core_with_labels: Chem.Mol,
+) -> dict[str, str]:
+    """R-group decomposition → {"R1": SMILES, "R2": SMILES, ...}."""
     parent_mol = Chem.MolFromSmiles(parent_smiles)
     if parent_mol is None:
         raise ValueError("Invalid parent SMILES.")
@@ -107,9 +298,8 @@ def get_original_rgroups(parent_smiles, core_with_labels):
 
     rows = rgd.GetRGroupsAsRows()
     if not rows:
-        raise RuntimeError("No R-group decomposition result was obtained.")
+        raise RuntimeError("No R-group decomposition result.")
 
-    # Exclude the "Core" key and convert each R-group molecule to SMILES
     return {
         key: Chem.MolToSmiles(mol)
         for key, mol in rows[0].items()
@@ -117,132 +307,13 @@ def get_original_rgroups(parent_smiles, core_with_labels):
     }
 
 
-# ──────────────────────────────────────────────
-# 4. Fragment attachment
-# ──────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# 4.  Fragment attachment
+# ──────────────────────────────────────────────────────────────────────────────
 
-def get_mol_wt(mol):
-    """Return the molecular weight (MolWt) of mol."""
-    return Descriptors.MolWt(mol)
-
-
-def _find_extension_atom(frag_mol, exclude_atom_idx):
-    """
-    Find the best atom in frag_mol on which to graft an additional
-    substituent, WITHOUT removing any existing atom.
-
-    A valid extension atom must:
-      - not be the dummy atom that connects this fragment to the scaffold core
-        (exclude_atom_idx)
-      - be a CARBON atom (atomic number 6)
-      - still have at least one free (implicit or explicit) H to replace
-
-    Restricting extension to carbon atoms is deliberate: if we allowed
-    grafting onto an existing heteroatom (e.g. the N of a primary amine, or
-    the O of an ether), the new group would bond directly to that
-    heteroatom, forming an unintended heteroatom-heteroatom bond -- for
-    example turning -NH2 into a hydrazine (-NH-NH2) or an ether oxygen into
-    an N-O linkage. These motifs are chemically real but are treated as
-    structural alerts in drug design (metabolic instability, mutagenicity
-    concerns for hydrazines, etc.) and are not what "add one HBD/HBA in a
-    minimal, drug-like way" is meant to produce. Requiring a carbon
-    extension point avoids generating them as an unintended side effect of
-    picking whichever atom happens to be topologically farthest.
-
-    Among valid (carbon) candidates, the one topologically farthest from
-    exclude_atom_idx is chosen, since extending at the far end of the
-    existing substituent (rather than right next to the scaffold) causes
-    the least disruption to the substituent's original role.
-
-    Returns the atom index, or None if no valid position exists (e.g. the
-    substituent is fully substituted, or is a bare heteroatom like -NH2
-    with no carbon to extend from).
-    """
-    candidates = [
-        atom.GetIdx()
-        for atom in frag_mol.GetAtoms()
-        if atom.GetIdx() != exclude_atom_idx
-        and atom.GetAtomicNum() == 6          # carbon only -- see docstring
-        and atom.GetTotalNumHs() > 0          # must have a free H to replace
-    ]
-    if not candidates:
-        return None
-
-    dist_matrix = Chem.GetDistanceMatrix(frag_mol)
-    candidates.sort(key=lambda idx: -dist_matrix[exclude_atom_idx][idx])
-    return candidates[0]
-
-
-def build_extended_rgroup_smiles(original_frag_smiles, addition_template, map_num):
-    """
-    Build a new R-group SMILES for attachment point map_num that adds the
-    functional group described by addition_template (e.g. "[*:1]N" for an
-    amino group) WITHOUT deleting any atom of the existing substituent.
-
-    This guarantees the resulting substituent's molecular weight and atom
-    count are >= the original substituent's, which in turn guarantees the
-    whole generated molecule's molecular weight is >= the parent's.
-
-    Two cases:
-      1. The site is currently unsubstituted (original fragment is just
-         "[*:map_num][H]"). Nothing of substance would be lost, so the
-         addition group simply becomes the new substituent.
-      2. The site already carries a real substituent. The addition group is
-         grafted onto the most distal atom of that substituent that still
-         has a free H, leaving every original atom in place.
-
-    Returns None if case 2 applies but the substituent has no free position
-    left to extend (fully substituted); the caller should then skip this
-    candidate rather than fall back to a destructive replacement.
-    """
-    frag_mol = Chem.MolFromSmiles(original_frag_smiles)
-    if frag_mol is None:
-        raise ValueError(f"Invalid original fragment SMILES: {original_frag_smiles}")
-
-    core_dummy_idx, _, _ = _get_dummy_info(frag_mol, map_num)
-
-    # Case 1: unsubstituted position -> addition group becomes the substituent.
-    has_real_substituent = any(
-        atom.GetIdx() != core_dummy_idx and atom.GetAtomicNum() > 1
-        for atom in frag_mol.GetAtoms()
-    )
-    if not has_real_substituent:
-        return addition_template.replace("[*:1]", f"[*:{map_num}]")
-
-    # Case 2: graft the addition group onto the existing substituent.
-    attach_idx = _find_extension_atom(frag_mol, exclude_atom_idx=core_dummy_idx)
-    if attach_idx is None:
-        return None  # fully substituted; cannot add without deleting atoms
-
-    # Locate the addition template's own dummy atom by atomic number (0),
-    # NOT by atom map number. The map number inside addition_template may be
-    # anything (e.g. "[*:2]N" when this site's label is 2), and could even
-    # collide with a map number already used in frag_mol once combined, so
-    # matching by map number here would be unreliable.
-    addition_mol = Chem.MolFromSmiles(addition_template)
-    if addition_mol is None:
-        raise ValueError(f"Invalid addition template SMILES: {addition_template}")
-    add_dummy_idx = next(
-        (a.GetIdx() for a in addition_mol.GetAtoms() if a.GetAtomicNum() == 0), None
-    )
-    if add_dummy_idx is None:
-        raise ValueError(f"No dummy atom found in addition template: {addition_template}")
-    add_nbr_atom = addition_mol.GetAtomWithIdx(add_dummy_idx).GetNeighbors()[0]
-    add_nbr_idx = add_nbr_atom.GetIdx()
-    add_bond_type = addition_mol.GetBondBetweenAtoms(add_dummy_idx, add_nbr_idx).GetBondType()
-
-    offset = frag_mol.GetNumAtoms()
-    combined = Chem.CombineMols(frag_mol, addition_mol)
-    emol = Chem.EditableMol(combined)
-    emol.AddBond(attach_idx, add_nbr_idx + offset, order=add_bond_type)
-    emol.RemoveAtom(add_dummy_idx + offset)  # only the addition's own dummy is removed
-    mol = emol.GetMol()
-    Chem.SanitizeMol(mol)
-    return Chem.MolToSmiles(mol)
-
-
-def _get_dummy_info(mol, map_num):
-    """Find the dummy atom [*:map_num] and return (dummy_idx, neighbor_idx, bond_type)."""
+def _get_dummy_info(
+    mol: Chem.Mol, map_num: int
+) -> tuple[int, int, Chem.rdchem.BondType]:
     for atom in mol.GetAtoms():
         if atom.GetAtomicNum() == 0 and atom.GetAtomMapNum() == map_num:
             nbr = atom.GetNeighbors()[0]
@@ -251,16 +322,18 @@ def _get_dummy_info(mol, map_num):
     raise ValueError(f"Dummy atom [*:{map_num}] not found.")
 
 
-def attach_fragment(scaffold_mol, fragment_mol, map_num):
-    """Connect the [*:map_num] attachment points of scaffold and fragment, then remove the dummy atoms."""
+def attach_fragment(
+    scaffold_mol: Chem.Mol,
+    fragment_mol: Chem.Mol,
+    map_num: int,
+) -> Chem.Mol:
+    """Join scaffold and fragment at [*:map_num]; remove dummy atoms."""
     s_dummy, s_nbr, s_bond = _get_dummy_info(scaffold_mol, map_num)
     f_dummy, f_nbr, _      = _get_dummy_info(fragment_mol, map_num)
 
     offset = scaffold_mol.GetNumAtoms()
     emol = Chem.EditableMol(Chem.CombineMols(scaffold_mol, fragment_mol))
     emol.AddBond(s_nbr, f_nbr + offset, order=s_bond)
-
-    # Remove dummy atoms from the higher index first to avoid index shifting
     for idx in sorted([s_dummy, f_dummy + offset], reverse=True):
         emol.RemoveAtom(idx)
 
@@ -269,16 +342,11 @@ def attach_fragment(scaffold_mol, fragment_mol, map_num):
     return mol
 
 
-def build_molecule(scaffold_smiles, rgroups):
-    """
-    Attach all R-groups in rgroups (e.g., {"R1": "[*:1]N", "R2": "[*:2]OC"})
-    to scaffold_smiles in ascending order of R-group number.
-    """
+def build_molecule(scaffold_smiles: str, rgroups: dict[str, str]) -> Chem.Mol:
+    """Attach all R-groups to scaffold in ascending site-number order."""
     mol = Chem.MolFromSmiles(scaffold_smiles)
     if mol is None:
         raise ValueError("Invalid scaffold SMILES.")
-
-    # Attach in ascending R-group number order to avoid order dependency
     for site in sorted(rgroups, key=lambda x: int(x[1:])):
         frag = Chem.MolFromSmiles(rgroups[site])
         if frag is None:
@@ -287,298 +355,500 @@ def build_molecule(scaffold_smiles, rgroups):
     return mol
 
 
-# ──────────────────────────────────────────────
-# 5. Fragment pools for increasing/decreasing each descriptor
-# ──────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# 5.  Transformation applicability (Step 2)
+# ──────────────────────────────────────────────────────────────────────────────
 
-# All templates use [*:1] as the attachment point placeholder.
-# At runtime, [*:1] is replaced with the actual R-group label [*:N].
-_FRAGMENT_TEMPLATES = {
-    # HBD (hydrogen bond donors)
-    "add_hbd": [
-        "[*:1]N",           # amino
-        "[*:1]NC",          # methylamino
-        "[*:1]O",           # hydroxy
-        "[*:1]c1ccc[nH]1",        # 3-pyrrolyl (aromatic ring N-H)
-        "[*:1]c1ccc2[nH]ccc2c1",  # indolyl (aromatic ring N-H)
-        # NOTE: unlike the templates above, the aromatic N-H in pyrrole/
-        # indole is conjugated into the ring and is not counted as an
-        # H-bond acceptor by RDKit (Lipinski.NumHAcceptors), so these two
-        # increase NumHDonors without also increasing NumHAcceptors.
-        # NOTE: a sulfonamide template ("[*:1]NS(=O)(=O)C") used to live here,
-        # but it was removed: it is equivalent to composing two separate,
-        # minimal single-feature edits -- (1) add_hbd with "[*:1]N" to create
-        # an NH2, then (2) add_hba with "[*:1]S(=O)(=O)C" to sulfonylate that
-        # new NH2 -- and bundling both into one template caused a single
-        # add_hbd call to also shift NumHAcceptors, NumRotatableBonds, and
-        # NumHeteroatoms far more than the other add_hbd templates do. Running
-        # scaffold-tuner twice (add_hbd, then add_hba) reproduces the exact
-        # same sulfonamide structure while keeping each call to a single,
-        # minimal descriptor change. See "[*:1]S(=O)(=O)C" under add_hba.
-    ],
-    "remove_hbd": [
-        "[*:1]C",           # methyl (no HBD)
-        "[*:1]CC",          # ethyl (no HBD)
-        "[*:1]F",           # fluoro (no HBD)
-        "[*:1]Cl",          # chloro (no HBD)
-        "[*:1]C(C)C",       # isopropyl (no HBD)
-    ],
-    # HBA (hydrogen bond acceptors)
-    "add_hba": [
-        "[*:1]OC",          # methoxy
-        "[*:1]C#N",         # cyano
-        "[*:1]C(=O)C",      # keto-like
-        "[*:1]N(C)C",       # tertiary amine
-        "[*:1]S(=O)(=O)C",  # methylsulfonyl (moved here from add_hbd; see note above)
-    ],
-    "remove_hba": [
-        "[*:1]C",           # methyl (no HBA)
-        "[*:1]CC",          # ethyl (no HBA)
-        "[*:1]F",           # fluoro (counted as HBA=0 by RDKit in most cases)
-        "[*:1]Cl",          # chloro (no HBA)
-        "[*:1]c1ccccc1",    # phenyl (no HBA)
-    ],
-    # NumAromaticRings
-    "add_ar": [
-        "[*:1]c1ccccc1",    # phenyl
-        "[*:1]c1ccncc1",    # pyridyl
-        "[*:1]c1ccco1",     # 2-furyl
-        "[*:1]c1cccs1",     # 2-thienyl
-    ],
-    "remove_ar": [
-        "[*:1]C",           # methyl (no aromatic ring)
-        "[*:1]CC",          # ethyl (no aromatic ring)
-        "[*:1]CCC",         # propyl (no aromatic ring)
-        "[*:1]C(C)C",       # isopropyl (no aromatic ring)
-        "[*:1]C1CCCCC1",    # cyclohexyl (no aromatic ring)
-    ],
-    # NumRotatableBonds
-    "add_rb": [
-        "[*:1]CC",          # ethyl (+1 rotatable bond)
-        "[*:1]CCC",         # propyl (+2 rotatable bonds)
-        "[*:1]CCCC",        # butyl (+3 rotatable bonds)
-        "[*:1]COC",         # methoxymethyl (+2 rotatable bonds)
-        "[*:1]CC(=O)C",     # acetonyl (+2 rotatable bonds)
-    ],
-    "remove_rb": [
-        "[*:1]C",           # methyl (no rotatable bonds)
-        "[*:1]F",           # fluoro (no rotatable bonds)
-        "[*:1]Cl",          # chloro (no rotatable bonds)
-        "[*:1]C1CC1",       # cyclopropyl (restricted rotation by ring)
-        "[*:1]C1CCCCC1",    # cyclohexyl (restricted rotation by ring)
-    ],
-    # NumHeteroatoms
-    "add_ha": [
-        "[*:1]N",           # amino (adds N)
-        "[*:1]O",           # hydroxy (adds O)
-        "[*:1]OC",          # methoxy (adds O)
-        "[*:1]F",           # fluoro (adds F)
-        "[*:1]S",           # thiol (adds S)
-    ],
-    "remove_ha": [
-        "[*:1]C",           # methyl (no heteroatoms)
-        "[*:1]CC",          # ethyl (no heteroatoms)
-        "[*:1]C(C)C",       # isopropyl (no heteroatoms)
-        "[*:1]c1ccccc1",    # phenyl (no heteroatoms)
-        "[*:1]C1CCCCC1",    # cyclohexyl (no heteroatoms)
-    ],
-}
-
-# mode → (descriptor index, direction)
-# Descriptor index corresponds to the return value of count_features():
-#   0=HBA, 1=HBD, 2=NumAromaticRings, 3=NumRotatableBonds, 4=NumHeteroatoms
-# Direction: +1 = increase expected, -1 = decrease expected
-_MODE_CONFIG = {
-    "add_hbd":    (1, +1),
-    "remove_hbd": (1, -1),
-    "add_hba":    (0, +1),
-    "remove_hba": (0, -1),
-    "add_ar":     (2, +1),
-    "remove_ar":  (2, -1),
-    "add_rb":     (3, +1),
-    "remove_rb":  (3, -1),
-    "add_ha":     (4, +1),
-    "remove_ha":  (4, -1),
-}
-
-def get_fragment_pool(mode, map_num):
-    """Return the fragment templates for the given mode with [*:1] replaced by [*:map_num]."""
-    if mode not in _FRAGMENT_TEMPLATES:
-        raise ValueError(f"mode must be one of {list(_MODE_CONFIG.keys())}")
-    return [t.replace("[*:1]", f"[*:{map_num}]") for t in _FRAGMENT_TEMPLATES[mode]]
+def normalize_fragment_smiles(smi: str) -> str:
+    """Canonicalize fragment SMILES; normalize attachment dummy to [*:1]."""
+    mol = Chem.MolFromSmiles(smi)
+    if mol is None:
+        return smi
+    for atom in mol.GetAtoms():
+        if atom.GetAtomicNum() == 0:
+            atom.SetAtomMapNum(1)
+    return Chem.MolToSmiles(mol)
 
 
-# ──────────────────────────────────────────────
-# 6. Main function: propose candidate structures
-# ──────────────────────────────────────────────
-def propose_structures(
-    parent_smiles,
-    mode="add_hbd",
-    max_cuts=None,
-    max_candidates=10,
-    shuffle_sites=False,
-    shuffle_fragments=False,
-    random_seed=None,
-    strict=False,
-):
+def extract_rgroups_for_smiles(
+    parent_smiles: str,
+    max_cuts: Optional[int] = None,
+) -> list[str] | None:
     """
-    Propose candidate structures in which one descriptor of the parent molecule
-    has been increased or decreased. Unmodified R-group positions retain the
-    original substituents from the parent molecule.
+    Public utility: extract and normalize R-group SMILES for a parent molecule.
+
+    This function is the single authoritative implementation shared by
+    propose_structures() (generation) and compute_applicability.py
+    (evaluation).  Using the same function in both places guarantees that
+    the R-group definition is identical across generation and evaluation.
 
     Parameters
     ----------
-    parent_smiles     : SMILES of the parent molecule
-    mode              : Transformation mode. One of the following:
-                          "add_hbd"    : increase hydrogen bond donor count
-                          "remove_hbd" : decrease hydrogen bond donor count
-                          "add_hba"    : increase hydrogen bond acceptor count
-                          "remove_hba" : decrease hydrogen bond acceptor count
-                          "add_ar"     : increase aromatic ring count
-                          "remove_ar"  : decrease aromatic ring count
-                          "add_rb"     : increase rotatable bond count
-                          "remove_rb"  : decrease rotatable bond count
-                          "add_ha"     : increase heteroatom count
-                          "remove_ha"  : decrease heteroatom count
-    max_cuts          : Maximum number of attachment points to label on the scaffold
-                        (None = use all boundary bonds)
-    max_candidates    : Maximum number of candidates to return
-    shuffle_sites     : If True, explore attachment sites in random order
-    shuffle_fragments : If True, explore fragments in random order
-    random_seed       : Random seed for reproducibility
-    strict            : If True, return only candidates in which exclusively the
-                        target descriptor has changed (all other descriptors unchanged)
+    parent_smiles : SMILES of the parent molecule
+    max_cuts      : maximum number of scaffold attachment points to label
+                    (None = use all boundary bonds, which is the default
+                    used by propose_structures)
 
-    Notes on molecular weight
-    -------------------------
-    For "add_*" modes (direction == +1), the target functional group is
-    grafted onto the existing substituent via build_extended_rgroup_smiles()
-    instead of replacing the substituent outright. This means no atom of the
-    original molecule is ever deleted for these modes, so the generated
-    molecule's molecular weight can only stay equal to or increase relative
-    to the parent -- it can never decrease. As a defensive second layer, any
-    candidate whose molecular weight is lower than the parent's is also
-    explicitly rejected below.
+    Returns
+    -------
+    List of normalized R-group SMILES strings (attachment dummy = [*:1])
+    for every attachment site, or None if scaffold / R-group extraction fails
+    for any reason (invalid SMILES, no boundary bonds, decomposition failure).
 
-    For "remove_*" modes (direction == -1), the previous replace-based
-    behavior is kept unchanged, since shrinking/removing a feature is
-    expected to reduce molecular weight as well.
+    Each string is the output of normalize_fragment_smiles(), so it can be
+    directly compared to library from_fragment values.
     """
-    if mode not in _MODE_CONFIG:
-        raise ValueError(f"mode must be one of {list(_MODE_CONFIG.keys())}")
+    try:
+        _, _, core = make_murcko_core_with_rlabels(parent_smiles, max_cuts=max_cuts)
+        rgroups    = get_original_rgroups(parent_smiles, core)
+    except Exception:
+        return None
+
+    if not rgroups:
+        return None
+
+    return [normalize_fragment_smiles(smi) for smi in rgroups.values()]
+
+
+def _exact_match(rgroup_smi: str, from_frag_smi: str) -> bool:
+    """
+    Return True iff parent R-group equals library from_fragment
+    (canonical SMILES comparison after normalizing attachment dummy).
+    """
+    return (
+        normalize_fragment_smiles(rgroup_smi)
+        == normalize_fragment_smiles(from_frag_smi)
+    )
+
+
+def _fragment_tanimoto(smi_a: str, smi_b: str, radius: int = 2, n_bits: int = 2048) -> float:
+    """Morgan-fingerprint Tanimoto between two fragment SMILES. 0.0 on failure."""
+    mol_a = Chem.MolFromSmiles(smi_a)
+    mol_b = Chem.MolFromSmiles(smi_b)
+    if mol_a is None or mol_b is None:
+        return 0.0
+    fp_a = rdMolDescriptors.GetMorganFingerprintAsBitVect(mol_a, radius, nBits=n_bits)
+    fp_b = rdMolDescriptors.GetMorganFingerprintAsBitVect(mol_b, radius, nBits=n_bits)
+    return DataStructs.TanimotoSimilarity(fp_a, fp_b)
+
+
+def _get_applicable_transforms(
+    current_rgroup_smi: str,
+    candidate_transforms: pd.DataFrame,
+    match_mode: str,
+    similarity_threshold: float,
+) -> pd.DataFrame:
+    """
+    Step 2: filter candidate_transforms to those applicable at this site.
+
+    match_mode="exact"  (default)
+        Exact canonical SMILES match only.  Returns empty DataFrame when
+        no exact match exists — no silent fallback.
+
+    match_mode="similarity"  (optional exploratory mode)
+        Tries exact first; if empty, falls back to Tanimoto >= threshold.
+        NOT for benchmark use.
+    """
+    if match_mode not in ("exact", "similarity"):
+        raise ValueError(
+            f"match_mode must be 'exact' or 'similarity', got '{match_mode}'."
+        )
+
+    mask_exact = candidate_transforms["from_fragment"].apply(
+        lambda frag: _exact_match(current_rgroup_smi, frag)
+    )
+    exact = candidate_transforms[mask_exact].copy()
+
+    if not exact.empty:
+        exact["match_type"]       = "exact"
+        exact["match_similarity"] = 1.0
+        return exact
+
+    if match_mode == "exact":
+        return pd.DataFrame()
+
+    # Similarity fallback (only when explicitly requested)
+    sims = candidate_transforms["from_fragment"].apply(
+        lambda frag: _fragment_tanimoto(current_rgroup_smi, frag)
+    )
+    mask_sim = sims >= similarity_threshold
+    if not mask_sim.any():
+        return pd.DataFrame()
+
+    similar = candidate_transforms[mask_sim].copy()
+    similar["match_type"]       = "similarity"
+    similar["match_similarity"] = sims[mask_sim].values
+    return similar.sort_values("match_similarity", ascending=False)
+
+
+def _adapt_to_fragment(to_frag_smi: str, map_num: int) -> str:
+    """Replace attachment dummy in to_frag_smi with [*:map_num]."""
+    mol = Chem.MolFromSmiles(to_frag_smi)
+    if mol is None:
+        raise ValueError(f"Invalid to_fragment SMILES: {to_frag_smi}")
+    for atom in mol.GetAtoms():
+        if atom.GetAtomicNum() == 0:
+            atom.SetAtomMapNum(map_num)
+    return Chem.MolToSmiles(mol)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 6.  Candidate ranking
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _collateral_change(
+    parent_feats: tuple[int, ...],
+    gen_feats: tuple[int, ...],
+    target_idx: int,
+) -> int:
+    """Sum |Δ| for all non-target descriptors (lower = fewer side-effects)."""
+    return sum(
+        abs(gen_feats[i] - parent_feats[i])
+        for i in range(len(parent_feats))
+        if i != target_idx
+    )
+
+
+def _rank_candidates(candidates: list[dict], target_idx: int) -> list[dict]:
+    """
+    Sort by:
+        1. collateral_change ascending
+        2. match_type: exact before similarity
+        3. transformation_frequency descending
+        4. match_similarity descending
+    """
+    def key(c: dict) -> tuple:
+        return (
+            c["collateral_change"],
+            0 if c.get("match_type", "exact") == "exact" else 1,
+            -c.get("transformation_frequency", 0),
+            -c.get("match_similarity", 1.0),
+        )
+    return sorted(candidates, key=key)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 7.  Diversity-aware MaxMin selection
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _maxmin_select(
+    candidates: list[dict],
+    n: int,
+    fp_radius: int = 2,
+    fp_bits: int = 2048,
+) -> list[dict]:
+    """
+    Select up to *n* structurally diverse candidates using MaxMin on
+    Morgan fingerprints.  Applied AFTER all filtering and ranking.
+    """
+    if len(candidates) <= n:
+        return candidates
+
+    fps, valid_indices = [], []
+    for idx, rec in enumerate(candidates):
+        mol = Chem.MolFromSmiles(rec["generated_smiles"])
+        if mol is not None:
+            fps.append(rdMolDescriptors.GetMorganFingerprintAsBitVect(
+                mol, fp_radius, nBits=fp_bits
+            ))
+            valid_indices.append(idx)
+
+    if not valid_indices:
+        return candidates[:n]
+
+    selected_vi = [0]
+    remaining_vi = list(range(1, len(valid_indices)))
+
+    while len(selected_vi) < n and remaining_vi:
+        best_vi, best_min_dist = None, -1.0
+        for vi in remaining_vi:
+            min_dist = min(
+                1.0 - DataStructs.TanimotoSimilarity(fps[vi], fps[sel])
+                for sel in selected_vi
+            )
+            if min_dist > best_min_dist:
+                best_min_dist, best_vi = min_dist, vi
+        if best_vi is None:
+            break
+        selected_vi.append(best_vi)
+        remaining_vi.remove(best_vi)
+
+    return [candidates[valid_indices[vi]] for vi in selected_vi]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 8.  Main API
+# ──────────────────────────────────────────────────────────────────────────────
+
+def propose_structures(
+    parent_smiles: str,
+    # primary API
+    target: Optional[str] = None,
+    delta: Optional[int] = None,
+    transformation_library: Optional[pd.DataFrame] = None,
+    # legacy API
+    mode: Optional[str] = None,
+    # shared options
+    max_cuts: Optional[int] = None,
+    max_candidates: int = 10,
+    shuffle_sites: bool = False,
+    random_seed: Optional[int] = None,
+    strict: bool = False,
+    # matching
+    match_mode: str = "exact",
+    similarity_threshold: float = 0.4,
+    # diversity
+    diversity: bool = False,
+) -> list[dict]:
+    """
+    Propose candidate structures in which one descriptor changes by exactly
+    *delta* units, using only transformations from the library whose
+    from_fragment exactly matches the parent R-group (default).
+
+    Primary API (v2)
+    ----------------
+    propose_structures(
+        parent_smiles,
+        target="HBA",   # HBD | HBA | AR | RotB | HA
+        delta=1,
+        transformation_library=lib,
+    )
+
+    Legacy API (backward-compatible)
+    ---------------------------------
+    propose_structures(parent_smiles, mode="add_hba", transformation_library=lib)
+
+    Parameters
+    ----------
+    match_mode          : "exact" (default) or "similarity" (exploratory only)
+    similarity_threshold: Tanimoto threshold for similarity fallback
+    diversity           : if True, apply MaxMin selection on final results
+    strict              : if True, all non-target descriptors must be unchanged
+
+    Returns
+    -------
+    List of dicts; each contains:
+        parent_smiles, generated_smiles,
+        target_descriptor, requested_delta, library_delta, actual_delta,
+        site, from_fragment, to_fragment,
+        transformation_frequency, transformation_source,
+        match_type, match_similarity,
+        parent_scaffold_smiles, generated_murcko_scaffold,
+        scaffold_preserved, collateral_change,
+        parent_features, generated_features
+    """
+    # ── resolve target / delta ────────────────────────────────────────────────
+    if mode is not None and target is None:
+        if mode not in _MODE_MAP:
+            raise ValueError(
+                f"Unknown mode '{mode}'. "
+                f"Supported modes: {sorted(_MODE_MAP.keys())}. "
+                "Note: 'remove_ar' is not supported in v2."
+            )
+        target, delta = _MODE_MAP[mode]
+
+    if target is None or delta is None:
+        raise ValueError(
+            "Specify target+delta (e.g. target='HBA', delta=1) "
+            "or the legacy mode string (e.g. mode='add_hba')."
+        )
+
+    if (target, delta) not in _SUPPORTED:
+        if target == "AR" and delta == -1:
+            raise ValueError(
+                "AR -1 (remove_ar) is not supported in v2. "
+                "Removing an aromatic ring from an R-group contradicts "
+                "the parent scaffold retention guarantee."
+            )
+        raise ValueError(
+            f"Unsupported (target, delta) = ({target!r}, {delta}). "
+            f"Supported: {sorted(_SUPPORTED)}."
+        )
+
+    if transformation_library is None:
+        raise ValueError(
+            "transformation_library is required. "
+            "Load one with load_transformation_library(path)."
+        )
+
+    target_idx = _DESC_INDEX[target]
 
     if random_seed is not None:
         random.seed(random_seed)
 
-    parent_mol, _, core = make_murcko_core_with_rlabels(parent_smiles, max_cuts=max_cuts)
-    core_smiles = Chem.MolToSmiles(core)
-    labels = get_r_labels(core)
+    # ── scaffold / R-group decomposition ─────────────────────────────────────
+    parent_mol, scaffold_mol, core = make_murcko_core_with_rlabels(
+        parent_smiles, max_cuts=max_cuts
+    )
+    core_smiles           = Chem.MolToSmiles(core)
+    labels                = get_r_labels(core)
     if not labels:
         return []
 
-    parent_canon = Chem.MolToSmiles(parent_mol)
-    parent_feats = count_features(parent_mol)
-    parent_mw = get_mol_wt(parent_mol)
-    feat_idx, direction = _MODE_CONFIG[mode]  # descriptor index and direction of change
+    parent_canon          = Chem.MolToSmiles(parent_mol)
+    parent_feats          = count_features(parent_mol)
+    parent_scaffold_smi   = Chem.MolToSmiles(scaffold_mol)
+    original_rgroups      = get_original_rgroups(parent_smiles, core)
 
-    original_rgroups = get_original_rgroups(parent_smiles, core)
+    # ── Step 1: descriptor-indexed retrieval ─────────────────────────────────
+    candidate_transforms = retrieve_transformations(
+        transformation_library, target, delta
+    )
+    if candidate_transforms.empty:
+        return []
 
     if shuffle_sites:
         labels = random.sample(labels, len(labels))
 
-    results, seen = [], set()
+    # ── Steps 2–8: generation and validation ─────────────────────────────────
+    all_candidates: list[dict] = []
+    seen: set[str] = set()
 
     for label in labels:
         site = f"R{label}"
-        pool = get_fragment_pool(mode, label)
-        if shuffle_fragments:
-            pool = random.sample(pool, len(pool))
+        current_rgroup_smi = original_rgroups.get(site)
+        if current_rgroup_smi is None:
+            continue
 
-        for frag_smiles in pool:
+        # Step 2: R-group matching (exact by default; no silent fallback)
+        applicable = _get_applicable_transforms(
+            current_rgroup_smi, candidate_transforms,
+            match_mode, similarity_threshold
+        )
+        if applicable.empty:
+            continue
+
+        for _, row in applicable.iterrows():
             try:
-                if direction > 0:
-                    # "add_*" mode: extend the existing substituent instead of
-                    # replacing it, so no atom is ever lost.
-                    new_frag_smiles = build_extended_rgroup_smiles(
-                        original_rgroups[site], frag_smiles, label
-                    )
-                    if new_frag_smiles is None:
-                        continue  # site fully substituted, cannot extend
-                    rgroups = {**original_rgroups, site: new_frag_smiles}
-                else:
-                    # "remove_*" mode: replacing with a smaller group is the
-                    # intended behavior (shrinking/removing a feature).
-                    rgroups = {**original_rgroups, site: frag_smiles}
+                # Step 3: generate candidate
+                new_frag_smi = _adapt_to_fragment(row["to_fragment"], label)
+                rgroups      = {**original_rgroups, site: new_frag_smi}
+                gen_mol      = build_molecule(core_smiles, rgroups)
+                gen_canon    = Chem.MolToSmiles(gen_mol)
 
-                gen_mol = build_molecule(core_smiles, rgroups)
-                gen_canon = Chem.MolToSmiles(gen_mol)
-
-                # Skip if identical to parent or already seen
                 if gen_canon == parent_canon or gen_canon in seen:
                     continue
                 seen.add(gen_canon)
 
-                gen_feats = count_features(gen_mol)
-                gen_mw = get_mol_wt(gen_mol)
-
-                # Safety net: for "add_*" modes the molecular weight must
-                # never decrease relative to the parent.
-                if direction > 0 and gen_mw < parent_mw:
+                # Step 5: parent scaffold retained as substructure
+                scaffold_preserved = bool(
+                    gen_mol.HasSubstructMatch(scaffold_mol)
+                )
+                if not scaffold_preserved:
                     continue
 
-                # Check that the target descriptor changed in the intended direction.
-                # When strict=True, also verify that no other descriptor has changed.
+                # Step 6: whole-molecule descriptor recomputation
+                gen_feats = count_features(gen_mol)
+
+                gen_scaffold_mol = MurckoScaffold.GetScaffoldForMol(gen_mol)
+                gen_scaffold_smi = (
+                    Chem.MolToSmiles(gen_scaffold_mol)
+                    if gen_scaffold_mol is not None else ""
+                )
+
+                # Step 7: exact requested delta validation
+                # library_delta is fragment-level (pre-filter); actual_delta
+                # is whole-molecule (final criterion).
+                actual_delta  = gen_feats[target_idx] - parent_feats[target_idx]
+                library_delta = int(row.get(f"delta_{target}", delta))
+
+                if actual_delta != delta:
+                    continue
+
+                # Step 8: strict filtering
                 other_unchanged = all(
                     gen_feats[i] == parent_feats[i]
-                    for i in range(len(parent_feats)) if i != feat_idx
+                    for i in range(len(parent_feats))
+                    if i != target_idx
                 )
-                if (direction * gen_feats[feat_idx] > direction * parent_feats[feat_idx]
-                        and (not strict or other_unchanged)):
-                    results.append({
-                        "mode": mode,
-                        "site": site,
-                        "fragment": frag_smiles,
-                        "parent_smiles": parent_canon,
-                        "generated_smiles": gen_canon,
-                        "parent_features": parent_feats,
-                        "generated_features": gen_feats,
-                    })
+                if strict and not other_unchanged:
+                    continue
+
+                collateral = _collateral_change(parent_feats, gen_feats, target_idx)
+
+                all_candidates.append({
+                    "parent_smiles":             parent_canon,
+                    "generated_smiles":          gen_canon,
+                    "target_descriptor":         target,
+                    "requested_delta":           delta,
+                    "library_delta":             library_delta,
+                    "actual_delta":              actual_delta,
+                    "site":                      site,
+                    "from_fragment":             row["from_fragment"],
+                    "to_fragment":               row["to_fragment"],
+                    "transformation_frequency":  int(row.get("frequency", 1)),
+                    "transformation_source":     str(row.get("source", "unknown")),
+                    "match_type":                str(row.get("match_type", "exact")),
+                    "match_similarity":          float(row.get("match_similarity", 1.0)),
+                    "parent_scaffold_smiles":    parent_scaffold_smi,
+                    "generated_murcko_scaffold": gen_scaffold_smi,
+                    "scaffold_preserved":        scaffold_preserved,
+                    "collateral_change":         collateral,
+                    "parent_features":           parent_feats,
+                    "generated_features":        gen_feats,
+                })
+
             except Exception:
                 continue
 
-            if len(results) >= max_candidates:
-                return results
+    if not all_candidates:
+        return []
 
-    return results
+    # Step 9: ranking
+    ranked = _rank_candidates(all_candidates, target_idx)
+
+    # Step 10: optional diversity selection
+    if diversity:
+        return _maxmin_select(ranked, max_candidates)
+
+    return ranked[:max_candidates]
 
 
-# ──────────────────────────────────────────────
-# 7. Display results
-# ──────────────────────────────────────────────
-FEATURE_NAMES = ["NumHAcceptors", "NumHDonors", "NumAromaticRings", "NumRotatableBonds", "NumHeteroatoms"]
-# Corresponds to the order of values returned by count_features()
+# ──────────────────────────────────────────────────────────────────────────────
+# 9.  Display helper
+# ──────────────────────────────────────────────────────────────────────────────
 
-def print_proposals(results):
+def print_proposals(results: list[dict]) -> None:
+    """Pretty-print results from propose_structures()."""
     if not results:
         print("No valid candidates found.")
         return
 
     for i, rec in enumerate(results, start=1):
         print(f"=== Candidate {i} ===")
-        print(f"mode: {rec['mode']},  site: {rec['site']},  fragment: {rec['fragment']}")
-        print(f"parent SMILES   : {rec['parent_smiles']}")
-        print(f"generated SMILES: {rec['generated_smiles']}")
-        print(f"features {FEATURE_NAMES}")
+        print(
+            f"target: {rec['target_descriptor']}  "
+            f"requested: {rec['requested_delta']:+d}  "
+            f"library: {rec['library_delta']:+d}  "
+            f"actual: {rec['actual_delta']:+d}  "
+            f"site: {rec['site']}  "
+            f"collateral: {rec['collateral_change']}"
+        )
+        print(f"from → to : {rec['from_fragment']} → {rec['to_fragment']}")
+        print(
+            f"freq: {rec['transformation_frequency']}  "
+            f"source: {rec['transformation_source']}  "
+            f"match: {rec['match_type']} ({rec['match_similarity']:.3f})"
+        )
+        print(
+            f"scaffold_preserved: {rec['scaffold_preserved']}  "
+            f"parent scaffold: {rec['parent_scaffold_smiles']}"
+        )
+        print(f"parent   : {rec['parent_smiles']}")
+        print(f"generated: {rec['generated_smiles']}")
+        print(f"features {DESCRIPTOR_NAMES}")
         print(f"  parent   : {rec['parent_features']}")
         print(f"  generated: {rec['generated_features']}")
         print()
 
 
-# ──────────────────────────────────────────────
-# 8. Display version information
-# ──────────────────────────────────────────────
-from scaffold_tuner import __version__
+# ──────────────────────────────────────────────────────────────────────────────
+# 10.  Version
+# ──────────────────────────────────────────────────────────────────────────────
 
-def get_version():
-    """Return the version of scaffold-tuner."""
+from scaffold_tuner import __version__  # noqa: E402
+
+
+def get_version() -> str:
+    """Return the installed version of scaffold-tuner."""
     return __version__
