@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "scaffold-tuner"
-version = "2.0.1"
+version = "2.0.2"
 description = "Descriptor-indexed R-group transformation tool for drug-like molecules"
 requires-python = ">=3.8"
 dependencies = ["pandas"]
